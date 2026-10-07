@@ -1,4 +1,4 @@
-//! Centralized constant definitions for the StellarSplit contract.
+//! Centralized constant definitions for the SplitVault contract.
 
 /// Issue #563: Minimum invoice TTL in ledgers.
 /// Set to ~60 days of ledgers (assuming ~5 seconds per ledger on Soroban).

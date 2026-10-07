@@ -1,4 +1,4 @@
-//! Shared test harness for StellarSplit integration tests.
+//! Shared test harness for SplitVault integration tests.
 //!
 //! Provides a standard environment, token client, and invoice factory that all
 //! integration tests reuse, eliminating boilerplate duplication across test files.

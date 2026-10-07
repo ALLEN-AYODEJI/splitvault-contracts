@@ -1,6 +1,6 @@
 # Contract Architecture
 
-Overview of the StellarSplit Soroban contract's internal design, storage model, and invoice lifecycle.
+Overview of the SplitVault Soroban contract's internal design, storage model, and invoice lifecycle.
 
 ## Directory Layout
 

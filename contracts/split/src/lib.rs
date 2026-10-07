@@ -1,11 +1,11 @@
-//! StellarSplit â on-chain invoice & payment splitting contract.
+//! SplitVault — on-chain invoice & payment splitting contract.
 //!
 //! Allows a creator to define an invoice with multiple recipients and amounts.
 //! Payers contribute funds; once fully funded the contract auto-routes USDC to
 //! each recipient. If the deadline passes unfunded, payers are refunded.
 //!
 //! Additionally features audit logging, invoice archival, and a contributor leaderboard.
-//! StellarSplit — on-chain invoice & payment splitting contract.
+//! SplitVault — on-chain invoice & payment splitting contract.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -2869,7 +2869,7 @@ impl SplitContract {
         // neither party can know the discrete log of one relative to the
         // other, then pin them in instance storage so every commit/reveal
         // uses the exact same basis.
-        let pedersen_dst = Bytes::from_slice(&env, b"StellarSplit-Pedersen-BLS12381G1-v1");
+        let pedersen_dst = Bytes::from_slice(&env, b"SplitVault-Pedersen-BLS12381G1-v1");
         let bls = env.crypto().bls12_381();
         let g = bls.hash_to_g1(&Bytes::from_slice(&env, b"pedersen-generator-G"), &pedersen_dst);
         let h = bls.hash_to_g1(&Bytes::from_slice(&env, b"pedersen-generator-H"), &pedersen_dst);

@@ -1,4 +1,4 @@
-//! StellarSplit Registry — on-chain index of all deployed split contract instances.
+//! SplitVault Registry — on-chain index of all deployed split contract instances.
 //!
 //! Maintains a searchable map from creator address to their list of deployed
 //! split contract addresses so frontends can discover active invoices.

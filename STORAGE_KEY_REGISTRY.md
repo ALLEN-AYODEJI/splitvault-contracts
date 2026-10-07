@@ -1,6 +1,6 @@
 # Storage Key Registry
 
-This document enumerates every storage key used by the StellarSplit contract, organized by storage tier and key type. Keys are defined in `contracts/split/src/storage_keys.rs` as `#[contracttype]` enums to prevent collisions and ensure XDR uniqueness.
+This document enumerates every storage key used by the SplitVault contract, organized by storage tier and key type. Keys are defined in `contracts/split/src/storage_keys.rs` as `#[contracttype]` enums to prevent collisions and ensure XDR uniqueness.
 
 ## Storage Tiers
 

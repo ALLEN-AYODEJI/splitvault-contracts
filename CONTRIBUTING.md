@@ -1,6 +1,6 @@
 # Contributing to split-contracts
 
-Thank you for your interest in contributing to StellarSplit! This repo is part of the [Drips Wave Program](https://drips.network/wave) — a monthly open-source bounty program run by the Stellar Development Foundation.
+Thank you for your interest in contributing to SplitVault! This repo is part of the [Drips Wave Program](https://drips.network/wave) — a monthly open-source bounty program run by the Stellar Development Foundation.
 
 ## Before You Start
 

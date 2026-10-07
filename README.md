@@ -1,18 +1,18 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/Stellar-split/.github/main/assets/stellarsplit-mark.svg" alt="StellarSplit" width="80" />
+  <img src="https://raw.githubusercontent.com/splitvault/.github/main/assets/splitvault-mark.svg" alt="SplitVault" width="80" />
   <h1>split-contracts</h1>
 </div>
 
 ![Rust](https://img.shields.io/badge/Rust-1.84+-orange?logo=rust)
 ![Soroban SDK](https://img.shields.io/badge/soroban--sdk-22.0.0-blueviolet)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![CI](https://github.com/stellar-split/split-contracts/actions/workflows/test.yml/badge.svg)
+![CI](https://github.com/splitvault/split-contracts/actions/workflows/test.yml/badge.svg)
 
-Soroban smart contracts powering **StellarSplit** — on-chain invoice & payment splitting on Stellar.
+Soroban smart contracts powering **SplitVault** — on-chain invoice & payment splitting on Stellar.
 
 ## What It Does
 
-StellarSplit lets users create on-chain invoices where multiple payers each owe a share. When all shares are paid, the contract automatically routes USDC to each recipient. If the deadline passes unfunded, contributors are refunded.
+SplitVault lets users create on-chain invoices where multiple payers each owe a share. When all shares are paid, the contract automatically routes USDC to each recipient. If the deadline passes unfunded, contributors are refunded.
 
 **Use cases:** group bills, freelancer team payments, remittances across LATAM and Africa.
 
@@ -47,7 +47,7 @@ cargo install --locked stellar-cli --features opt
 ### Clone & Build
 
 ```bash
-git clone https://github.com/stellar-split/split-contracts.git
+git clone https://github.com/splitvault/split-contracts.git
 cd split-contracts
 cargo build --target wasm32-unknown-unknown --release
 ```

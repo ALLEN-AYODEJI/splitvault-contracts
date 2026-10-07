@@ -1,6 +1,6 @@
 # Contract API Reference
 
-Full reference for all public entry points in the StellarSplit Soroban contract (`contracts/split/src/lib.rs`).
+Full reference for all public entry points in the SplitVault Soroban contract (`contracts/split/src/lib.rs`).
 
 ## Table of Contents
 

@@ -1,4 +1,4 @@
-//! Invoice Escrow Contract — StellarSplit
+//! Invoice Escrow Contract — SplitVault
 //!
 //! Provides on-chain invoice escrow with:
 //! - Multi-payer deposit aggregation
