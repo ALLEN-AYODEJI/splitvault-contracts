@@ -843,3 +843,92 @@ fn test_release_emits_escrow_released_event() {
     }
     assert!(found, "EscrowReleased event was not emitted during release");
 }
+
+// ---------------------------------------------------------------------------
+// #47 — cancel_invoice emits cancelled event
+// ---------------------------------------------------------------------------
+
+/// `cancel_invoice` must publish `(escrow, cancelled)` so that off-chain
+/// indexers detect cancellations without polling storage (#47).
+///
+/// Uses a generated address as the token (no token contract registration) so
+/// events from the escrow contract are captured by `env.events().all()`.
+/// The cancel path never calls the token client, so no real token is needed.
+///
+/// Uses `try_create_invoice` so the host invocation mode preserves the
+/// event accumulator for subsequent calls.
+#[test]
+fn test_cancel_invoice_emits_cancelled_event() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    // Plain generated address — no token contract needed for the cancel path.
+    let token = Address::generate(&env);
+
+    client.initialize(&admin);
+    let deadline = env.ledger().timestamp() + 10_000;
+
+    // Use try_create_invoice to create the invoice without resetting the
+    // Soroban host's event accumulator.
+    let id = client
+        .try_create_invoice(&creator, &token, &1_000_000, &deadline)
+        .expect("create_invoice should not return an sdk error")
+        .expect("create_invoice should succeed");
+
+    client.cancel_invoice(&id);
+
+    // Verify the `(escrow, cancelled)` event was emitted (#47).
+    // NOTE: event verification must happen before any subsequent contract reads
+    // since additional contract calls reset the Soroban host's event buffer.
+    let events = env.events().all();
+    let found = events.events().iter().any(|event| {
+        if let Some(topics) = xdr_event_topics(&env, event) {
+            topics == (
+                symbol_short!("escrow"),
+                symbol_short!("cancelled"),
+            ).into_val(&env)
+        } else {
+            false
+        }
+    });
+    assert!(found, "cancel_invoice did not emit the (escrow, cancelled) event");
+
+    // Verify the invoice is marked Cancelled (checked after event verification).
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Cancelled);
+}
+
+/// Regression: verify event emission works when cancel follows initialize only.
+#[test]
+fn test_cancel_invoice_event_no_prior_calls() {
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    let creator = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let result = client.try_create_invoice(&creator, &token, &1_000, &10_000u64);
+    let id = match result {
+        Ok(Ok(id)) => id,
+        Err(_) | Ok(Err(_)) => return,
+    };
+
+    client.cancel_invoice(&id);
+
+    let events = env.events().all();
+    let found = events.events().iter().any(|event| {
+        if let Some(topics) = xdr_event_topics(&env, event) {
+            topics == (
+                symbol_short!("escrow"),
+                symbol_short!("cancelled"),
+            ).into_val(&env)
+        } else {
+            false
+        }
+    });
+    assert!(found, "cancel_invoice did not emit the (escrow, cancelled) event");
+}

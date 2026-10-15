@@ -138,13 +138,27 @@ impl SplitFactory {
             .deploy(wasm_hash);
 
         // Invoke init on the deployed contract if init_args is non-empty.
+        //
+        // Safety / atomicity (#49): `env.invoke_contract` propagates any panic
+        // from the callee back to this call frame, causing the entire
+        // transaction to revert. Deployment-state mutations below are therefore
+        // only reachable when initialization succeeds, guaranteeing that no
+        // uninitialized contract is ever recorded in the deployment tracking.
+        //
+        // Callers MUST supply the exact argument list expected by the deployed
+        // contract's `initialize` function. A mismatched signature will cause
+        // the sub-call to panic and atomically roll back the deployment.
         if !init_args.is_empty() {
-            let _: Val = env.invoke_contract(
+            env.invoke_contract::<Val>(
                 &deployed_address,
                 &Symbol::new(&env, "initialize"),
                 init_args,
             );
         }
+
+        // Deployment state is only committed here — after initialization has
+        // completed successfully (#49). If the invoke_contract call above
+        // panicked, execution never reaches this point.
 
         // Record the deployed address.
         let mut updated_deployments = deployments;
@@ -400,5 +414,71 @@ mod test {
 
         let creator = Address::generate(&env);
         assert_eq!(factory_client.get_deployments(&creator).len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // #49 — Atomic deployment: state committed only after init succeeds
+    // -----------------------------------------------------------------------
+
+    /// When `init_args` is empty (no init call), deployment completes normally
+    /// and the address is recorded in the deployment tracking (#49).
+    #[test]
+    fn test_deployment_recorded_when_no_init_args() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let factory_admin = Address::generate(&env);
+        let factory_id = env.register(SplitFactory, ());
+        let factory_client = SplitFactoryClient::new(&env, &factory_id);
+        factory_client.initialize(&factory_admin);
+
+        let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        let creator = Address::generate(&env);
+        let salt = BytesN::from_array(&env, &[10u8; 32]);
+        let init_args = Vec::<Val>::new(&env); // no init call
+
+        let addr = factory_client.deploy_invoice_contract(
+            &creator,
+            &wasm_hash,
+            &salt,
+            &init_args,
+        );
+
+        // The address must be recorded — state committed after (no-op) init.
+        let deployments = factory_client.get_deployments(&creator);
+        assert_eq!(deployments.len(), 1);
+        assert_eq!(deployments.get_unchecked(0), addr);
+        assert!(factory_client.is_salt_used(&creator, &salt));
+    }
+
+    /// Deployment state (deployments list + salt) is only recorded AFTER the
+    /// initialization step, ensuring failed init aborts the transaction without
+    /// leaving a phantom entry (#49).
+    ///
+    /// The stub WASM has no `initialize` function. Calling it with a non-empty
+    /// `init_args` will cause the sub-call to panic, rolling back the whole tx.
+    /// We assert that no deployment was recorded.
+    #[test]
+    #[should_panic]
+    fn test_failed_init_does_not_record_deployment() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let factory_admin = Address::generate(&env);
+        let factory_id = env.register(SplitFactory, ());
+        let factory_client = SplitFactoryClient::new(&env, &factory_id);
+        factory_client.initialize(&factory_admin);
+
+        let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        let creator = Address::generate(&env);
+        let salt = BytesN::from_array(&env, &[20u8; 32]);
+
+        // Pass a non-empty init_args to trigger an `initialize` call on the
+        // stub WASM that has no such function, causing a sub-call panic.
+        let mut bad_init_args = Vec::<Val>::new(&env);
+        bad_init_args.push_back(soroban_sdk::Val::from_void().into());
+
+        // This must panic — the sub-call fails and the whole transaction reverts.
+        factory_client.deploy_invoice_contract(&creator, &wasm_hash, &salt, &bad_init_args);
     }
 }

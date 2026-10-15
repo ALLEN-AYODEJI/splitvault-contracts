@@ -180,6 +180,17 @@ fn emit_blacklist_finalised(env: &Env, payer: &Address, upheld: bool) {
     );
 }
 
+/// Topics: `(escrow, cancelled)` — Data: `invoice_id`
+///
+/// Emitted by [`InvoiceEscrowContract::cancel_invoice`] so off-chain indexers
+/// and notification webhooks can detect cancellations without polling storage.
+fn emit_cancelled(env: &Env, invoice_id: u64) {
+    env.events().publish(
+        (symbol_short!("escrow"), symbol_short!("cancelled")),
+        invoice_id,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
@@ -563,6 +574,7 @@ impl InvoiceEscrowContract {
         }
         invoice.status = EscrowStatus::Cancelled;
         save_invoice(&env, invoice_id, &invoice);
+        emit_cancelled(&env, invoice_id);
         Ok(())
     }
 
