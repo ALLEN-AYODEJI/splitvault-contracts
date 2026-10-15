@@ -585,7 +585,8 @@ fn test_extend_deadline() {
     c.cancel_invoice(&creator, &id);
 
     let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.status, InvoiceStatus::Refunded);
+    // Issue #28: cancel_invoice always sets Cancelled (even when funded > 0).
+    assert_eq!(invoice.status, InvoiceStatus::Cancelled);
     assert_eq!(tk.balance(&payer), 300);
 }
 
@@ -3076,19 +3077,19 @@ fn test_stage_release_3_stages() {
     assert_eq!(c.get_invoice_ext(&id).released_stages, 0);
 
     // Stage 1: 30% = 300
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
     assert_eq!(tk.balance(&recipient), 300);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 1);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
 
     // Stage 2: 40% = 400
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &1_u32, &creator);
     assert_eq!(tk.balance(&recipient), 700);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 2);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
 
     // Stage 3: 30% = 300 — final stage sets status to Released
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &2_u32, &creator);
     assert_eq!(tk.balance(&recipient), 1_000);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 3);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
@@ -3122,10 +3123,10 @@ fn test_stage_release_after_all_stages_panics() {
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
     c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
 
-    c.stage_release(&id, &creator);
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
+    c.stage_release(&id, &1_u32, &creator);
     // Third call should panic — all stages already released.
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &2_u32, &creator);
 }
 
 #[test]
@@ -3157,7 +3158,7 @@ fn test_stage_release_non_creator_panics() {
     c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
 
     // Non-creator should not be able to call stage_release.
-    c.stage_release(&id, &other);
+    c.stage_release(&id, &0_u32, &other);
 }
 
 #[test]
@@ -3189,7 +3190,7 @@ fn test_stage_release_not_fully_funded_panics() {
     c.pay(&payer, &id, &500_i128, &0_u64, &false, &false, &None);
 
     // Should panic — not fully funded.
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
 }
 
 #[test]
@@ -8688,3 +8689,236 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #27: withdraw reads contributions from sharded storage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_withdraw_reads_from_sharded_storage() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    opts.allow_early_withdrawal = true;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Make a partial payment; contributions go into shard storage.
+    c.pay(&payer, &id, &300_i128, &0_u64, &false, &false, &None);
+    assert_eq!(tk.balance(&payer), 200);
+
+    // withdraw should succeed — contributions are read from sharded storage,
+    // not from invoice.payments (which is always empty).
+    c.withdraw(&id, &payer);
+
+    // Payer should have been fully refunded.
+    assert_eq!(tk.balance(&payer), 500);
+    // Invoice funded amount should have decreased.
+    assert_eq!(c.get_invoice(&id).funded, 0);
+}
+
+#[test]
+#[should_panic(expected = "no contributions to withdraw")]
+fn test_withdraw_panics_for_non_payer() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &300);
+    env.ledger().set_timestamp(1_000);
+
+    let mut opts = default_options(&env);
+    opts.allow_early_withdrawal = true;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    // Invoice requires 500 so a payment of 300 keeps it in Pending.
+    amounts.push_back(500_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    c.pay(&payer, &id, &300_i128, &0_u64, &false, &false, &None);
+
+    // Stranger never contributed — should panic.
+    c.withdraw(&id, &stranger);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #28: cancel_invoice always transitions to Cancelled
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cancel_funded_invoice_sets_cancelled_not_refunded() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+
+    // Payer has contributed 200; cancel should refund and set status Cancelled.
+    c.cancel_invoice(&creator, &id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Cancelled);
+    // Payer should have been refunded.
+    assert_eq!(tk.balance(&payer), 200);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #29: stage_release enforces sequential ordering
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic]
+fn test_stage_release_out_of_order_panics() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // 3 stages: 30% / 40% / 30%
+    let mut stages: Vec<u32> = Vec::new(&env);
+    stages.push_back(3_000u32);
+    stages.push_back(4_000u32);
+    stages.push_back(3_000u32);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+
+    let mut opts = default_options(&env);
+    opts.release_stages = stages;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
+
+    // Stage 0 and 1 are unreleased; attempting stage 2 must revert.
+    c.stage_release(&id, &2_u32, &creator);
+}
+
+#[test]
+#[should_panic]
+fn test_stage_release_skipping_first_stage_panics() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let mut stages: Vec<u32> = Vec::new(&env);
+    stages.push_back(5_000u32);
+    stages.push_back(5_000u32);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+
+    let mut opts = default_options(&env);
+    opts.release_stages = stages;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+    c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
+
+    // Attempt stage 1 before stage 0 — must revert.
+    c.stage_release(&id, &1_u32, &creator);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #30: dashboard notified on all cancellation paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cancel_unfunded_invoice_notifies_dashboard() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    // Register the dashboard contract.
+    let dashboard_id = env.register(dashboard::DashboardContract, ());
+    let dashboard_c = dashboard::DashboardContractClient::new(&env, &dashboard_id);
+    dashboard_c.initialize(&contract_id);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    c.set_dashboard_contract(&admin, &dashboard_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Cancel with no funding.
+    c.cancel_invoice(&creator, &id);
+
+    let dash = dashboard_c.get_creator_dashboard(&creator);
+    assert_eq!(dash.refunded_count, 1, "dashboard should record cancellation even when funded == 0");
+}
+
+#[test]
+fn test_cancel_funded_invoice_notifies_dashboard() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let dashboard_id = env.register(dashboard::DashboardContract, ());
+    let dashboard_c = dashboard::DashboardContractClient::new(&env, &dashboard_id);
+    dashboard_c.initialize(&contract_id);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    c.set_dashboard_contract(&admin, &dashboard_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+
+    // Cancel with partial funding.
+    c.cancel_invoice(&creator, &id);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Cancelled);
+    let dash = dashboard_c.get_creator_dashboard(&creator);
+    assert_eq!(dash.refunded_count, 1, "dashboard should record cancellation when funded > 0");
+}

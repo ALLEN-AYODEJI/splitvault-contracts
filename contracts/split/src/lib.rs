@@ -9820,9 +9820,12 @@ impl SplitContract {
 
     /// Release the next predefined stage of funds to recipients.
     ///
-    /// Requires creator auth. Each call distributes the next stage's proportion
-    /// of the total funded amount. The final stage sets the invoice status to Released.
-    pub fn stage_release(env: Env, invoice_id: u64, creator: Address) {
+    /// Requires creator auth. Each call distributes the specified stage's proportion
+    /// of the total funded amount. Stages must be released in order: attempting to
+    /// release a stage while a prior stage is still pending will revert with
+    /// `ContractError::PriorStageNotReleased`. The final stage sets the invoice
+    /// status to Released.
+    pub fn stage_release(env: Env, invoice_id: u64, stage_id: u32, creator: Address) {
         require_not_paused(&env);
         creator.require_auth();
 
@@ -9845,6 +9848,14 @@ impl SplitContract {
 
         let total: i128 = invoice.amounts.iter().sum();
         assert!(invoice.funded >= total, "invoice not fully funded");
+
+        // Issue #29: enforce sequential stage ordering — stage_id must equal
+        // released_stages (the next expected stage index).
+        assert!(
+            stage_id == invoice.released_stages,
+            "{}",
+            ContractError::PriorStageNotReleased as u32
+        );
 
         let stage_idx = invoice.released_stages;
         assert!(
@@ -11802,12 +11813,12 @@ impl SplitContract {
                 invoice.insurance_fund = 0;
             }
 
-            invoice.status = InvoiceStatus::Refunded;
+            invoice.status = InvoiceStatus::Cancelled;
             events::invoice_state_changed(
                 &env,
                 invoice_id,
                 Some(&InvoiceStatus::Pending),
-                &InvoiceStatus::Refunded,
+                &InvoiceStatus::Cancelled,
                 &caller,
             );
             maybe_record_refunded(&env, &invoice.creator);
@@ -11846,6 +11857,8 @@ impl SplitContract {
                 &InvoiceStatus::Cancelled,
                 &caller,
             );
+            // Issue #30: notify dashboard on cancellation regardless of funding.
+            maybe_record_refunded(&env, &invoice.creator);
         }
 
         // Issue #503: decrement per-creator open-invoice counter on cancel.
@@ -12470,12 +12483,14 @@ impl SplitContract {
             "invoice is not pending"
         );
 
-        let mut total_paid: i128 = 0;
-        for payment in invoice.payments.iter() {
-            if payment.payer == payer {
-                total_paid += payment.amount;
-            }
-        }
+        // Issue #27: payments are stored in shards, not on invoice.payments.
+        // Read the payer's total contribution from the per-payer contribution record.
+        let contrib_key = contribution_key(invoice_id, &payer);
+        let total_paid: i128 = env
+            .storage()
+            .persistent()
+            .get(&contrib_key)
+            .unwrap_or(0i128);
         assert!(total_paid > 0, "no contributions to withdraw");
 
         // Remove payer's payments from all shards (issue #177).
@@ -13991,6 +14006,8 @@ impl SplitContract {
         save_invoice(&env, invoice_id, &invoice);
 
         events::refund_claimed(&env, invoice_id, &payer, payer_total);
+        // Issue #30: notify dashboard when a payer claims a refund on an expired invoice.
+        maybe_record_refunded(&env, &invoice.creator);
         append_audit_entry(&env, invoice_id, symbol_short!("clm_ref"), &payer);
     }
 
