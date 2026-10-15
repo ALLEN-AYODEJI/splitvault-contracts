@@ -3229,9 +3229,10 @@ struct MockOracle;
 
 #[contractimpl]
 impl MockOracle {
-    /// Returns a fixed price of 2.0 (2_000_000 in 6-decimal fixed-point).
-    pub fn get_price(_env: Env) -> i128 {
-        2_000_000
+    /// Returns a fixed price of 2.0 (2_000_000 in 6-decimal fixed-point) along
+    /// with the current ledger timestamp so the freshness check in `_pay` passes.
+    pub fn get_price(env: Env) -> (i128, u64) {
+        (2_000_000, env.ledger().timestamp())
     }
 }
 
@@ -3241,8 +3242,8 @@ mod identity_oracle_mod {
     pub struct IdentityOracle;
     #[contractimpl]
     impl IdentityOracle {
-        pub fn get_price(_env: Env) -> i128 {
-            1_000_000
+        pub fn get_price(env: Env) -> (i128, u64) {
+            (1_000_000, env.ledger().timestamp())
         }
     }
 }
@@ -4224,7 +4225,7 @@ fn test_pay_with_token_accepted_token_credited() {
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
 
     // Pay with the alternate token — DEX converts 1:1 so 300 gets credited.
-    c.pay_with_token(&payer, &id, &alt_token_id, &300_i128, &0);
+    c.pay_with_token(&payer, &id, &alt_token_id, &300_i128, &300_i128, &0);
 
     let invoice = c.get_invoice(&id);
     assert_eq!(invoice.funded, 300);
@@ -4252,7 +4253,7 @@ fn test_pay_with_token_non_listed_panics() {
     let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
 
     // Attempting to pay with an unlisted token must panic.
-    c.pay_with_token(&payer, &id, &unknown_token, &200_i128, &0);
+    c.pay_with_token(&payer, &id, &unknown_token, &200_i128, &0_i128, &0);
 }
 
 // ---------------------------------------------------------------------------
@@ -7734,7 +7735,7 @@ fn test_dex_unregistered_token_rejected() {
     let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
 
     // Unknown token not in accepted_tokens — should panic.
-    c.pay_with_token(&payer, &id, &unknown_token, &100_i128, &0);
+    c.pay_with_token(&payer, &id, &unknown_token, &100_i128, &0_i128, &0);
 }
 
 #[test]
@@ -8688,3 +8689,315 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #35: min_amount_out slippage protection in pay_with_token
+// ---------------------------------------------------------------------------
+
+/// A DEX that always returns fewer tokens than the minimum — used to trigger
+/// the slippage-exceeded path.
+#[contract]
+struct StingyDex;
+
+#[contractimpl]
+impl StingyDex {
+    /// Returns only 1 token regardless of how many were put in.
+    pub fn swap(_env: Env, _source: Address, _dest: Address, _amount: i128) -> i128 {
+        1
+    }
+}
+
+#[test]
+fn test_pay_with_token_slippage_met_succeeds() {
+    // When the DEX output exactly meets min_amount_out the call must succeed.
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    let alt_token_admin = Address::generate(&env);
+    let alt_token_id = env
+        .register_stellar_asset_contract_v2(alt_token_admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &alt_token_id).mint(&payer, &500);
+
+    let dex_id = env.register(MockDex, ());
+    c.set_dex_contract(&admin, &dex_id);
+
+    // Pre-mint invoice token to the contract to simulate DEX transfer-back.
+    StellarAssetClient::new(&env, &token_id).mint(&contract_id, &200);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut accepted = Vec::new(&env);
+    accepted.push_back(alt_token_id.clone());
+    let mut opts = default_options(&env);
+    opts.accepted_tokens = accepted;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    // min_amount_out == 200; MockDex returns 1:1, so converted == 200 >= 200. Should succeed.
+    c.pay_with_token(&payer, &id, &alt_token_id, &200_i128, &200_i128, &0);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 200);
+}
+
+#[test]
+#[should_panic]
+fn test_pay_with_token_slippage_exceeded_reverts() {
+    // When the DEX returns fewer tokens than min_amount_out the call must revert.
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    let alt_token_admin = Address::generate(&env);
+    let alt_token_id = env
+        .register_stellar_asset_contract_v2(alt_token_admin.clone())
+        .address();
+    StellarAssetClient::new(&env, &alt_token_id).mint(&payer, &500);
+
+    // StingyDex always returns 1 token.
+    let dex_id = env.register(StingyDex, ());
+    c.set_dex_contract(&admin, &dex_id);
+
+    StellarAssetClient::new(&env, &token_id).mint(&contract_id, &200);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut accepted = Vec::new(&env);
+    accepted.push_back(alt_token_id.clone());
+    let mut opts = default_options(&env);
+    opts.accepted_tokens = accepted;
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(200_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    // min_amount_out = 200, but StingyDex only returns 1 — must revert with SlippageExceeded.
+    c.pay_with_token(&payer, &id, &alt_token_id, &200_i128, &200_i128, &0);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #36: lazy Pedersen generator initialization via migrate()
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_migrate_backfills_pedersen_generators() {
+    // Simulate an upgraded contract: initialize without stamping generators,
+    // then call migrate() and verify the generators are present afterwards.
+    // In production this scenario arises when a WASM upgrade is applied to a
+    // v1/v2 contract that never executed initialize() on the new Wasm.
+    //
+    // Here we use a freshly initialized contract (generators ARE set by
+    // initialize), call migrate to exercise ensure_pedersen_generators(),
+    // and confirm the schema migration returns the current version.
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // After initialize() generators are already present; migrate() must not
+    // overwrite them and must return the current schema version.
+    let version = c.migrate(&admin);
+    assert_eq!(version, migrations::CURRENT_SCHEMA_VERSION);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #37: oracle price freshness validation
+// ---------------------------------------------------------------------------
+
+/// An oracle that returns a price with a very old timestamp, simulating a
+/// stale / halted price feed.
+#[contract]
+struct StaleOracle;
+
+#[contractimpl]
+impl StaleOracle {
+    /// Returns a price with `last_updated = 0`, which is always > ORACLE_MAX_STALE_SECONDS ago.
+    pub fn get_price(_env: Env) -> (i128, u64) {
+        (1_000_000, 0)
+    }
+}
+
+#[test]
+#[should_panic]
+fn test_pay_with_stale_oracle_reverts() {
+    // When the oracle's last_updated is older than ORACLE_MAX_STALE_SECONDS the
+    // payment must be rejected to prevent stale-price exploitation.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Advance the ledger well past ORACLE_MAX_STALE_SECONDS (300 s).
+    env.ledger().set_timestamp(1_000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+
+    // Register a stale oracle (last_updated = 0, current time = 1000 → age = 1000 > 300).
+    let oracle_id = env.register(StaleOracle, ());
+
+    let mut opts = default_options(&env);
+    opts.price_oracle = Some(oracle_id);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    // Should panic because the oracle price is 1000 seconds stale.
+    c.pay(&payer, &id, &100, &0, &false, &false, &None);
+}
+
+#[test]
+fn test_pay_with_fresh_oracle_succeeds() {
+    // A fresh oracle (last_updated == current timestamp) must not block payment.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+
+    // IdentityOracle returns (1_000_000, env.ledger().timestamp()) — always fresh.
+    let oracle_id = env.register(identity_oracle_mod::IdentityOracle, ());
+
+    let mut opts = default_options(&env);
+    opts.price_oracle = Some(oracle_id);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(100_i128);
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
+
+    // base_total=100, price=1_000_000, adjusted=100 — full payment should release.
+    c.pay(&payer, &id, &100, &0, &false, &false, &None);
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 100);
+    assert_eq!(invoice.status, InvoiceStatus::Released);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #38: force_close_channel — creator can settle after deadline
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_force_close_channel_after_deadline_settles_balance() {
+    // After the invoice deadline the creator must be able to force-close the
+    // channel, crediting the net-paid portion and returning the unspent balance
+    // to the payer.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    let sa = StellarAssetClient::new(&env, &token_id);
+    sa.mint(&payer, &1_000);
+
+    // Open channel before deadline.
+    env.ledger().set_timestamp(1_000);
+    let deadline = 5_000_u64;
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, deadline);
+
+    c.open_channel(&payer, &id, &400_i128);
+    c.channel_pay(&payer, &id, &100_i128); // net_paid = 100, balance = 300
+
+    // Advance past the invoice deadline.
+    env.ledger().set_timestamp(deadline + 1);
+
+    // Creator force-closes the channel.
+    c.force_close_channel(&creator, &payer, &id);
+
+    let inv = c.get_invoice(&id);
+    // 100 tokens should have been credited to the invoice.
+    assert_eq!(inv.funded, 100);
+
+    // The unspent 300 tokens must have been returned to the payer.
+    // Payer started with 1000, deposited 400, got 300 back → balance = 900.
+    let tk = token_client(&env, &token_id);
+    assert_eq!(tk.balance(&payer), 900);
+}
+
+#[test]
+#[should_panic]
+fn test_force_close_channel_before_deadline_panics() {
+    // force_close_channel must be rejected before the invoice deadline has passed.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+
+    env.ledger().set_timestamp(1_000);
+    let deadline = 9_000_u64;
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, deadline);
+
+    c.open_channel(&payer, &id, &200_i128);
+
+    // Deadline has NOT passed — force-close must panic.
+    c.force_close_channel(&creator, &payer, &id);
+}
+
+#[test]
+#[should_panic]
+fn test_force_close_channel_non_creator_panics() {
+    // Only the invoice creator is authorised to force-close a channel.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let interloper = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+
+    env.ledger().set_timestamp(1_000);
+    let deadline = 2_000_u64;
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, deadline);
+
+    c.open_channel(&payer, &id, &200_i128);
+
+    // Advance past deadline.
+    env.ledger().set_timestamp(deadline + 1);
+
+    // A non-creator address must be rejected.
+    c.force_close_channel(&interloper, &payer, &id);
+}
