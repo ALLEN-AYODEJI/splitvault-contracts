@@ -3071,6 +3071,13 @@ impl SplitContract {
         // Only allow withdrawal while invoice is in Pending (Open) status.
         assert_invoice_pending(&invoice)?;
 
+        // Issue #51: Honour the creator's allow_early_withdrawal setting.
+        // If the invoice was created with early withdrawal disabled, reject
+        // any attempt to pull funds out before the deadline/release.
+        if !invoice.allow_early_withdrawal {
+            return Err(ContractError::NotAuthorized);
+        }
+
         let contrib_key = contribution_key(invoice_id, &payer);
         let amount: i128 = env
             .storage()
@@ -5942,6 +5949,13 @@ impl SplitContract {
             metadata_hash: metadata_hash.clone(),
         };
 
+        // Issue #53: Verify that all recipients have a trustline for the
+        // funding token before writing any storage. This surfaces missing
+        // trustlines at invoice-creation time rather than at release time.
+        if let Err(e) = validation::assert_recipients_have_trustlines(env, &invoice.funding_token, &invoice.recipients) {
+            env.panic_with_error(e);
+        }
+
         save_invoice(env, id, &invoice);
 
         // Issue #332: persist contiguous recipient + amount vectors for optimised release.
@@ -8131,7 +8145,7 @@ impl SplitContract {
         // Uses temporary storage so the lock is never persisted across transactions.
         let re_key = reentrancy_lock_key();
         if env.storage().temporary().has(&re_key) {
-            panic!("{}", ContractError::ReentrantCall as u32);
+            panic_with_error!(env, ContractError::ReentrantCall);
         }
         env.storage().temporary().set(&re_key, &true);
         // ------------------------------------------------
@@ -9293,11 +9307,12 @@ impl SplitContract {
         let n = invoice.recipients.len();
 
         let proportional = if !invoice.ratios.is_empty() {
-            let amount = invoice.amounts.get(idx).unwrap();
-            let ratio = invoice.ratios.get(idx).unwrap();
-            let denom = invoice.ratio_denominator as u128;
-            let r = ratio as u128;
-            checked_proportion(amount as u128, r, denom).expect("ArithmeticOverflow")
+                let ratio = invoice.ratios.get(idx).unwrap();
+                let denom = invoice.ratio_denominator as u128;
+                let r = ratio as u128;
+                // Issue #54: apportion the *funded* pool by ratio, not the
+                // per-recipient target amount.
+                checked_proportion(funded as u128, r, denom).expect("ArithmeticOverflow")
         } else if idx == n - 1 {
             // Last recipient gets remainder
             funded - {
@@ -10192,11 +10207,14 @@ impl SplitContract {
 
             // Issue: if split_rules are defined, compute payout from rule instead of amounts[].
             let proportional = if !invoice.ratios.is_empty() {
-                let amount = invoice.amounts.get(i).unwrap();
                 let ratio = invoice.ratios.get(i).unwrap();
                 let denom = invoice.ratio_denominator as u128;
                 let r = ratio as u128;
-                checked_proportion(amount as u128, r, denom).expect("ArithmeticOverflow")
+                // Issue #54: apportion the *funded* pool by ratio, not the
+                // per-recipient target amount.  Using `amount` here caused
+                // recipients to receive only (amount × ratio/denom) instead of
+                // the correct (funded × ratio/denom).
+                checked_proportion(funded as u128, r, denom).expect("ArithmeticOverflow")
             } else if !invoice.split_rules.is_empty() {
                 let rule = invoice.split_rules.get(i).unwrap();
                 match rule {
@@ -11118,7 +11136,7 @@ impl SplitContract {
         // --- Reentrancy guard (issue #451-reentrancy) ---
         let re_key = reentrancy_lock_key();
         if env.storage().temporary().has(&re_key) {
-            panic!("{}", ContractError::ReentrantCall as u32);
+            panic_with_error!(env, ContractError::ReentrantCall);
         }
         env.storage().temporary().set(&re_key, &true);
         // ------------------------------------------------
@@ -11690,7 +11708,7 @@ impl SplitContract {
         // --- Reentrancy guard (issue #451-reentrancy) ---
         let re_key = reentrancy_lock_key();
         if env.storage().temporary().has(&re_key) {
-            panic!("{}", ContractError::ReentrantCall as u32);
+            panic_with_error!(env, ContractError::ReentrantCall);
         }
         env.storage().temporary().set(&re_key, &true);
         // ------------------------------------------------

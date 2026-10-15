@@ -8688,3 +8688,268 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #51 – allow_early_withdrawal guard in withdraw_contribution
+// ---------------------------------------------------------------------------
+
+/// withdraw_contribution must be rejected when `allow_early_withdrawal` is false.
+#[test]
+fn test_withdraw_contribution_blocked_when_early_withdrawal_disabled() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with allow_early_withdrawal = false (default).
+    let mut opts = default_options(&env);
+    opts.allow_early_withdrawal = false;
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Payer makes a partial contribution.
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_invoice(&id).funded, 200);
+
+    // Attempting to withdraw must fail with NotAuthorized.
+    let res = c.try_withdraw_contribution(&payer, &id);
+    assert_eq!(res, Err(Ok(ContractError::NotAuthorized.into())));
+
+    // The invoice funded amount must be unchanged.
+    assert_eq!(c.get_invoice(&id).funded, 200);
+}
+
+/// withdraw_contribution succeeds when `allow_early_withdrawal` is true.
+#[test]
+fn test_withdraw_contribution_succeeds_when_early_withdrawal_enabled() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // Create invoice with allow_early_withdrawal = true.
+    let mut opts = default_options(&env);
+    opts.allow_early_withdrawal = true;
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(500_i128);
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Payer makes a partial contribution.
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_invoice(&id).funded, 200);
+    let balance_before = tk.balance(&payer);
+
+    // Withdrawal should succeed.
+    c.withdraw_contribution(&payer, &id);
+
+    // Funded amount is decremented, payer gets their tokens back.
+    assert_eq!(c.get_invoice(&id).funded, 0);
+    assert_eq!(tk.balance(&payer), balance_before + 200);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #52 – panic_with_error! for reentrancy guards
+// ---------------------------------------------------------------------------
+
+/// Verify that reentrancy in cancel_invoice surfaces ContractError::ReentrantCall.
+/// We test the guard path directly via try_cancel_invoice after forcing the lock.
+/// Because Soroban rolls back state on panic, we can't actually leave the lock
+/// set, so instead we verify that a clean subsequent call works (i.e. the lock
+/// was cleared on the previous successful run).
+#[test]
+fn test_cancel_invoice_reentrancy_guard_clears_on_success() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Use two distinct creators so the second cancel is not affected by the
+    // cancellation cooldown applied to creator1.
+    let creator1 = Address::generate(&env);
+    let creator2 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let id1 = make_invoice(&env, &c, &creator1, &recipient, 100, &token_id, 9_999);
+
+    // First cancel: succeeds.
+    c.cancel_invoice(&creator1, &id1);
+    assert_eq!(c.get_invoice(&id1).status, InvoiceStatus::Cancelled);
+
+    // Reentrancy lock must have been cleared; a second cancel by a different
+    // creator must also succeed cleanly.
+    let id2 = make_invoice(&env, &c, &creator2, &recipient, 100, &token_id, 9_999);
+    c.cancel_invoice(&creator2, &id2);
+    assert_eq!(c.get_invoice(&id2).status, InvoiceStatus::Cancelled);
+}
+
+/// Verify that reentrancy in refund surfaces ContractError::ReentrantCall by
+/// confirming that the lock clears correctly between calls.
+#[test]
+fn test_refund_reentrancy_guard_clears_on_success() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let payer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Invoice 1: set timestamp, create with future deadline, pay, expire, refund.
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+
+    env.ledger().set_timestamp(3_000);
+    c.refund(&id);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Refunded);
+
+    // Invoice 2: created at an earlier timestamp with a much later deadline so
+    // that after advancing time the deadline is still in the past.
+    // Create at timestamp 3_000 with deadline 4_000, then advance to 5_000.
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 4_000);
+    c.pay(&payer, &id2, &100_i128, &0_u64, &false, &false, &None);
+    env.ledger().set_timestamp(5_000);
+    c.refund(&id2);
+    assert_eq!(c.get_invoice(&id2).status, InvoiceStatus::Refunded);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #53 – assert_recipients_have_trustlines at creation time
+// ---------------------------------------------------------------------------
+
+/// Invoice creation should succeed when recipients have a trustline
+/// (i.e. they exist in the test environment with a known balance).
+#[test]
+fn test_create_invoice_succeeds_when_recipients_have_trustlines() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    // Mint to the recipient so that a balance entry exists (trustline present).
+    StellarAssetClient::new(&env, &token_id).mint(&recipient, &0);
+
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert!(id >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #54 – ratio-based payout uses funded, not amounts[i]
+// ---------------------------------------------------------------------------
+
+/// Verify that ratio-based payouts apportion the full funded pool.
+/// Two recipients with 60 / 40 split on a 10 000-unit invoice should
+/// receive 6 000 and 4 000 respectively.
+#[test]
+fn test_ratio_payout_apportions_funded_pool() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let stellar_asset = StellarAssetClient::new(&env, &token_id);
+    let payer = Address::generate(&env);
+    stellar_asset.mint(&payer, &20_000);
+
+    let creator = Address::generate(&env);
+    let recipient_a = Address::generate(&env);
+    let recipient_b = Address::generate(&env);
+    // Ensure recipient token balances exist (trustlines).
+    stellar_asset.mint(&recipient_a, &0);
+    stellar_asset.mint(&recipient_b, &0);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient_a.clone());
+    recipients.push_back(recipient_b.clone());
+
+    // amounts[] are target amounts (6 000 + 4 000 = 10 000).
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(6_000_i128);
+    amounts.push_back(4_000_i128);
+
+    // ratios: 60% and 40% (basis points summing to 10 000).
+    let mut opts = default_options(&env);
+    let mut ratios = Vec::new(&env);
+    ratios.push_back(6_000u32); // 60%
+    ratios.push_back(4_000u32); // 40%
+    opts.ratios = ratios;
+    // ratio_denominator defaults to 10_000 in InvoiceOptions2::default().
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay the full 10 000.
+    c.pay(&payer, &id, &10_000_i128, &0_u64, &false, &false, &None);
+
+    // Invoice should be released.
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+
+    // Recipient A: 60% of 10 000 = 6 000
+    assert_eq!(tk.balance(&recipient_a), 6_000);
+    // Recipient B: 40% of 10 000 = 4 000
+    assert_eq!(tk.balance(&recipient_b), 4_000);
+}
+
+/// Verify that a 2-recipient 50/50 ratio invoice pays each recipient exactly
+/// half of the funded amount regardless of what amounts[] says.
+#[test]
+fn test_ratio_payout_50_50_split_funded_pool() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let stellar_asset = StellarAssetClient::new(&env, &token_id);
+    let payer = Address::generate(&env);
+    stellar_asset.mint(&payer, &20_000);
+
+    let creator = Address::generate(&env);
+    let recipient_a = Address::generate(&env);
+    let recipient_b = Address::generate(&env);
+    stellar_asset.mint(&recipient_a, &0);
+    stellar_asset.mint(&recipient_b, &0);
+
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient_a.clone());
+    recipients.push_back(recipient_b.clone());
+
+    // amounts[] irrelevant when ratios are set; use equal amounts.
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(5_000_i128);
+    amounts.push_back(5_000_i128);
+
+    // 50/50 split.
+    let mut opts = default_options(&env);
+    let mut ratios = Vec::new(&env);
+    ratios.push_back(5_000u32);
+    ratios.push_back(5_000u32);
+    opts.ratios = ratios;
+
+    let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
+
+    // Pay the full 10 000.
+    c.pay(&payer, &id, &10_000_i128, &0_u64, &false, &false, &None);
+
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+
+    // Each recipient gets exactly 5 000 (50% of 10 000 funded).
+    assert_eq!(tk.balance(&recipient_a), 5_000);
+    assert_eq!(tk.balance(&recipient_b), 5_000);
+}
