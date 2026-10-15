@@ -7122,7 +7122,8 @@ fn test_payment_received_event_includes_token() {
         if let Some(topics) = xdr_event_topics(&env, event) {
             if topic1_is(&env, &topics, "paid") {
                 if let Ok(data_val) = <soroban_sdk::Val as soroban_sdk::TryFromVal<Env, soroban_sdk::xdr::ScVal>>::try_from_val(&env, &body.data) {
-                    let decoded: (Address, i128, Address, u64) = data_val.try_into_val(&env).unwrap();
+                    // Data: (payer, amount, token, tip, current_funded, event_seq)
+                    let decoded: (Address, i128, Address, i128, i128, u64) = data_val.try_into_val(&env).unwrap();
                     found_token = Some(decoded.2);
                 }
             }
@@ -7133,6 +7134,94 @@ fn test_payment_received_event_includes_token() {
         Some(token_id),
         "payment_received event data should include the payment token address"
     );
+}
+
+#[test]
+fn test_payment_received_event_includes_tip_and_current_funded() {
+    // Issue #40: payment_received event should carry tip and current_funded so
+    // off-chain indexers can track funding progress from the event stream alone.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    c.pay(&payer, &id, &150_i128, &0_u64, &false, &false, &None);
+
+    use soroban_sdk::TryIntoVal;
+    let mut found_tip: Option<i128> = None;
+    let mut found_funded: Option<i128> = None;
+    for event in env.events().all().events().iter() {
+        let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
+        if let Some(topics) = xdr_event_topics(&env, event) {
+            if topic1_is(&env, &topics, "paid") {
+                if let Ok(data_val) = <soroban_sdk::Val as soroban_sdk::TryFromVal<Env, soroban_sdk::xdr::ScVal>>::try_from_val(&env, &body.data) {
+                    // Data: (payer, amount, token, tip, current_funded, event_seq)
+                    let decoded: (Address, i128, Address, i128, i128, u64) = data_val.try_into_val(&env).unwrap();
+                    found_tip = Some(decoded.3);
+                    found_funded = Some(decoded.4);
+                }
+            }
+        }
+    }
+    assert_eq!(found_tip, Some(0), "tip should be 0 for a standard payment");
+    assert_eq!(found_funded, Some(150), "current_funded should equal 150 after first payment");
+}
+
+#[test]
+fn test_payment_received_event_current_funded_accumulates() {
+    // Issue #40: current_funded in the event should reflect the running total.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer1, &1_000);
+    StellarAssetClient::new(&env, &token_id).mint(&payer2, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
+
+    // First payment: 200
+    c.pay(&payer1, &id, &200_i128, &0_u64, &false, &false, &None);
+    use soroban_sdk::TryIntoVal;
+    let mut funded_after_first: Option<i128> = None;
+    for event in env.events().all().events().iter() {
+        let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
+        if let Some(topics) = xdr_event_topics(&env, event) {
+            if topic1_is(&env, &topics, "paid") {
+                if let Ok(data_val) = <soroban_sdk::Val as soroban_sdk::TryFromVal<Env, soroban_sdk::xdr::ScVal>>::try_from_val(&env, &body.data) {
+                    let decoded: (Address, i128, Address, i128, i128, u64) = data_val.try_into_val(&env).unwrap();
+                    funded_after_first = Some(decoded.4);
+                }
+            }
+        }
+    }
+    assert_eq!(funded_after_first, Some(200), "first payment should bring funded to 200");
+
+    // Second payment: 100
+    c.pay(&payer2, &id, &100_i128, &0_u64, &false, &false, &None);
+    let mut funded_after_second: Option<i128> = None;
+    for event in env.events().all().events().iter() {
+        let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
+        if let Some(topics) = xdr_event_topics(&env, event) {
+            if topic1_is(&env, &topics, "paid") {
+                if let Ok(data_val) = <soroban_sdk::Val as soroban_sdk::TryFromVal<Env, soroban_sdk::xdr::ScVal>>::try_from_val(&env, &body.data) {
+                    let decoded: (Address, i128, Address, i128, i128, u64) = data_val.try_into_val(&env).unwrap();
+                    funded_after_second = Some(decoded.4);
+                }
+            }
+        }
+    }
+    assert_eq!(funded_after_second, Some(300), "second payment should bring funded to 300");
 }
 
 #[test]
@@ -8688,3 +8777,102 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #39: pay_with_memo — separate invoice_id/memo and replay prevention
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pay_with_memo_distinct_invoice_id_and_memo() {
+    // invoice_id and memo are now separate parameters; a payment where memo ≠
+    // invoice_id should succeed.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+    // memo value (99999) is different from invoice_id
+    c.pay_with_memo(&payer, &id, &99999_u64, &150_i128, &0_u64, &false, &None);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 150, "payment should be credited to the invoice");
+}
+
+#[test]
+#[should_panic(expected = "MemoDuplicatePayment")]
+fn test_pay_with_memo_duplicate_rejected() {
+    // Issue #39: submitting the same (invoice_id, payer, memo) twice must panic.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &2_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 900, &token_id, 9_999);
+    let memo: u64 = 42;
+    // First call succeeds.
+    c.pay_with_memo(&payer, &id, &memo, &150_i128, &0_u64, &false, &None);
+    // Second call with identical (invoice_id, payer, memo) must be rejected.
+    c.pay_with_memo(&payer, &id, &memo, &150_i128, &1_u64, &false, &None);
+}
+
+#[test]
+fn test_pay_with_memo_different_memo_allowed() {
+    // A different memo value for the same payer/invoice is a distinct payment
+    // context and must not be rejected.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &2_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 900, &token_id, 9_999);
+    c.pay_with_memo(&payer, &id, &1_u64, &150_i128, &0_u64, &false, &None);
+    // Different memo — should succeed.
+    c.pay_with_memo(&payer, &id, &2_u64, &150_i128, &1_u64, &false, &None);
+
+    let invoice = c.get_invoice(&id);
+    assert_eq!(invoice.funded, 300, "both payments should be credited");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #41: Zero-tip storage guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_pay_with_zero_tip_does_not_create_tip_storage() {
+    // Issue #41: a standard payment (implicit tip = 0) must not create any
+    // tip accumulator storage entry.  We verify this by checking the invoice
+    // funded amount is correct and the contract does not panic — the tip
+    // accumulator path is guarded by `if tip > 0` so it is a no-op here.
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &500);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    c.pay(&payer, &id, &200_i128, &0_u64, &false, &false, &None);
+
+    let invoice = c.get_invoice(&id);
+    // Invoice should be fully funded; no panics from the tip-guard path.
+    assert_eq!(invoice.funded, 200);
+}

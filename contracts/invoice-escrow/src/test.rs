@@ -843,3 +843,160 @@ fn test_release_emits_escrow_released_event() {
     }
     assert!(found, "EscrowReleased event was not emitted during release");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #42: Batched refunds — partial batches must not lock remaining payers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_refund_batched_all_payers_receive_funds() {
+    // Issue #42: refund with [payer1] then [payer2, payer3] — all three must
+    // receive their deposits without the second call failing with InvalidStatus.
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+    let payer3 = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    // Mint enough for each payer's deposit.
+    mint(&env, &token, &token_admin, &payer1, 300_000);
+    mint(&env, &token, &token_admin, &payer2, 300_000);
+    mint(&env, &token, &token_admin, &payer3, 300_000);
+
+    client.initialize(&admin);
+    // Create invoice with a deadline of 1 (in the past after we advance ledger).
+    let id = client.create_invoice(&creator, &token, &3_000_000, &1u64);
+
+    // Each payer deposits 100_000.
+    client.deposit(&payer1, &id, &100_000);
+    client.deposit(&payer2, &id, &100_000);
+    client.deposit(&payer3, &id, &100_000);
+
+    // Advance time past deadline.
+    env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+        timestamp: 1_000_000,
+        protocol_version: env.ledger().protocol_version(),
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 10,
+        min_persistent_entry_ttl: 10,
+        max_entry_ttl: 3_110_400,
+    });
+
+    // First batch: refund only payer1.
+    let mut batch1 = soroban_sdk::Vec::new(&env);
+    batch1.push_back(payer1.clone());
+    client.refund(&id, &batch1);
+
+    // Invoice must NOT be Refunded yet — deposits still remain for payer2/payer3.
+    let invoice_mid = client.get_invoice(&id);
+    assert_ne!(
+        invoice_mid.status,
+        EscrowStatus::Refunded,
+        "invoice should not be Refunded after first partial batch"
+    );
+
+    // Second batch: refund payer2 and payer3.
+    let mut batch2 = soroban_sdk::Vec::new(&env);
+    batch2.push_back(payer2.clone());
+    batch2.push_back(payer3.clone());
+    // This must NOT return InvalidStatus.
+    client.refund(&id, &batch2);
+
+    // Now all deposits are gone; invoice should be Refunded.
+    let invoice_final = client.get_invoice(&id);
+    assert_eq!(
+        invoice_final.status,
+        EscrowStatus::Refunded,
+        "invoice should be Refunded once all deposits are returned"
+    );
+
+    // All payers should have their funds back.
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer1), 300_000, "payer1 should be fully refunded");
+    assert_eq!(token_client.balance(&payer2), 300_000, "payer2 should be fully refunded");
+    assert_eq!(token_client.balance(&payer3), 300_000, "payer3 should be fully refunded");
+}
+
+#[test]
+fn test_refund_single_batch_still_sets_refunded() {
+    // Refunding all payers in one batch should still set status to Refunded.
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    mint(&env, &token, &token_admin, &payer, 500_000);
+    client.initialize(&admin);
+    let id = client.create_invoice(&creator, &token, &1_000_000, &1u64);
+    client.deposit(&payer, &id, &200_000);
+
+    env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+        timestamp: 1_000_000,
+        protocol_version: env.ledger().protocol_version(),
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 10,
+        min_persistent_entry_ttl: 10,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let mut payers = soroban_sdk::Vec::new(&env);
+    payers.push_back(payer.clone());
+    client.refund(&id, &payers);
+
+    let invoice = client.get_invoice(&id);
+    assert_eq!(invoice.status, EscrowStatus::Refunded);
+
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&payer), 500_000);
+}
+
+#[test]
+fn test_refund_second_batch_after_fully_refunded_fails() {
+    // Once all deposits are refunded (status = Refunded) any further refund
+    // call must return InvalidStatus.
+    let (env, contract_id) = setup();
+    let client = InvoiceEscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+
+    mint(&env, &token, &token_admin, &payer, 500_000);
+    client.initialize(&admin);
+    let id = client.create_invoice(&creator, &token, &1_000_000, &1u64);
+    client.deposit(&payer, &id, &200_000);
+
+    env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+        timestamp: 1_000_000,
+        protocol_version: env.ledger().protocol_version(),
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 10,
+        min_persistent_entry_ttl: 10,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let mut payers = soroban_sdk::Vec::new(&env);
+    payers.push_back(payer.clone());
+    client.refund(&id, &payers);
+
+    // Attempt to refund again after status is already Refunded.
+    let extra_payer = Address::generate(&env);
+    let mut extra = soroban_sdk::Vec::new(&env);
+    extra.push_back(extra_payer);
+    let result = client.try_refund(&id, &extra);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}

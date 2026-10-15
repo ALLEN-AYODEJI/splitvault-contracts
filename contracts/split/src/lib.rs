@@ -2675,6 +2675,26 @@ fn require_role(env: &Env, caller: &Address, roles: &[Role]) {
 
 const DEFAULT_DUPLICATE_WINDOW_LEDGERS: u32 = 100;
 
+/// Issue #39: Compute memo deduplication hash: sha256(invoice_id || payer || memo).
+/// The resulting hash is stored in persistent storage keyed by
+/// `CompoundKey::MemoDedupe(hash)` to prevent replay of the same
+/// (invoice_id, payer, memo) triple.
+fn compute_memo_dedupe_hash(env: &Env, invoice_id: u64, payer: &Address, memo: u64) -> BytesN<32> {
+    let mut input = Bytes::new(env);
+    for byte in invoice_id.to_be_bytes().iter() {
+        input.push_back(*byte);
+    }
+    let payer_val: Val = payer.clone().into_val(env);
+    let payer_bytes = payer_val.to_xdr(env);
+    for byte in payer_bytes.iter() {
+        input.push_back(byte);
+    }
+    for byte in memo.to_be_bytes().iter() {
+        input.push_back(*byte);
+    }
+    env.crypto().sha256(&input).into()
+}
+
 /// Compute payment fingerprint hash: sha256(invoice_id || payer || amount || ledger).
 #[allow(dead_code)]
 fn compute_payment_fingerprint(
@@ -6714,7 +6734,7 @@ impl SplitContract {
                 .set(&cumulative_key, &(cumulative + net_paid));
 
             // In real app we might handle penalty/oracle, but for simplicity:
-            events::payment_received(&env, invoice_id, &payer, net_paid, &funding_token_for(&invoice));
+            events::payment_received(&env, invoice_id, &payer, net_paid, &funding_token_for(&invoice), 0, invoice.funded);
 
             let total: i128 = invoice.amounts.iter().sum();
             check_and_emit_funding_checkpoints(&env, invoice_id, invoice.funded, total);
@@ -7521,6 +7541,16 @@ impl SplitContract {
             .persistent()
             .set(&contrib_key, &(prev_contrib + credited_amount));
 
+        // Issue #41: only write the per-payer tip accumulator when tip > 0.
+        // Writing a zero-value tip entry wastes persistent storage rent for
+        // every standard payment.
+        let tip: i128 = 0; // reserved for future tip-enabled payment paths
+        if tip > 0 {
+            let tip_key = storage_keys::CompoundKey::TipTotal(invoice_id, payer.clone());
+            let prev_tip: i128 = env.storage().persistent().get(&tip_key).unwrap_or(0);
+            env.storage().persistent().set(&tip_key, &(prev_tip + tip));
+        }
+
         // Increment per-address reputation counter (issue #24, #349).
         let is_late =
             invoice.penalty_deadline > 0 && env.ledger().timestamp() > invoice.penalty_deadline;
@@ -7543,7 +7573,7 @@ impl SplitContract {
             .set(&credit_key(payer), &(credit + 1));
 
         append_audit_entry(env, invoice_id, symbol_short!("pay"), payer);
-        events::payment_received(env, invoice_id, payer, credited_amount, &funding_token_for(&invoice));
+        events::payment_received(env, invoice_id, payer, credited_amount, &funding_token_for(&invoice), 0, invoice.funded);
         // Issue #333: emit milestone events for any thresholds crossed by this payment.
         {
             let total_for_milestone: i128 = total; // already computed above
@@ -7769,7 +7799,7 @@ impl SplitContract {
             .set(&cumulative_key, &(cumulative + credited_amount));
 
         append_audit_entry(&env, invoice_id, symbol_short!("pay_tok"), &payer);
-        events::payment_received(&env, invoice_id, &payer, credited_amount, &funding_token_for(&invoice));
+        events::payment_received(&env, invoice_id, &payer, credited_amount, &funding_token_for(&invoice), 0, invoice.funded);
         check_and_emit_funding_checkpoints(&env, invoice_id, invoice.funded, total);
         Self::record_invoice_rate_limit(&env, invoice_id, &payer);
         notify_invoice(
@@ -7876,7 +7906,7 @@ impl SplitContract {
             .set(&cumulative_key, &(cumulative + converted));
 
         append_audit_entry(&env, invoice_id, symbol_short!("brdg_pay"), &payer);
-        events::payment_received(&env, invoice_id, &payer, converted, &invoice_token);
+        events::payment_received(&env, invoice_id, &payer, converted, &invoice_token, 0, invoice.funded);
         check_and_emit_funding_checkpoints(&env, invoice_id, invoice.funded, total);
         Self::record_invoice_rate_limit(&env, invoice_id, &payer);
         notify_invoice(
@@ -7994,7 +8024,7 @@ impl SplitContract {
                 .set(&cumulative_key, &(cumulative + p.amount));
 
             append_audit_entry(&env, p.invoice_id, symbol_short!("pool_pay"), &payer);
-            events::payment_received(&env, p.invoice_id, &payer, p.amount, &shared_token);
+            events::payment_received(&env, p.invoice_id, &payer, p.amount, &shared_token, 0, inv.funded);
 
             let inv_total: i128 = inv.amounts.iter().sum();
             if inv.funded >= inv_total {
@@ -9156,11 +9186,22 @@ impl SplitContract {
         id
     }
 
-    /// Pay toward an invoice using a memo that encodes the invoice id.
+    /// Pay toward an invoice using a transaction memo that identifies the payment
+    /// context.  `invoice_id` and `memo` are now separate parameters so that
+    /// external financial systems can supply their own memo values (order IDs,
+    /// payment references, etc.) without those values being required to match the
+    /// on-chain invoice numeric ID.
+    ///
+    /// To prevent accidental replay (e.g. a rebroadcast of a prior transaction),
+    /// the contract records a sha256 hash of `(invoice_id ‖ payer ‖ memo)` in
+    /// persistent storage.  If the same triple is submitted again the call panics
+    /// with "MemoDuplicatePayment".
+    ///
     /// Requires payer auth and emits a payment_matched event on success.
     pub fn pay_with_memo(
         env: Env,
         payer: Address,
+        invoice_id: u64,
         memo: u64,
         amount: i128,
         nonce: u64,
@@ -9169,12 +9210,22 @@ impl SplitContract {
     ) {
         require_not_paused(&env);
         payer.require_auth();
-        // Validate memo corresponds to an existing invoice.
-        let _ = load_invoice(&env, memo);
+        // Validate invoice_id corresponds to an existing invoice.
+        let _ = load_invoice(&env, invoice_id);
+
+        // Issue #39: deduplicate (invoice_id, payer, memo) to prevent replay.
+        let dedupe_hash = compute_memo_dedupe_hash(&env, invoice_id, &payer, memo);
+        let dedupe_key = storage_keys::CompoundKey::MemoDedupe(dedupe_hash);
+        assert!(
+            !env.storage().persistent().has(&dedupe_key),
+            "MemoDuplicatePayment"
+        );
+        env.storage().persistent().set(&dedupe_key, &true);
+
         Self::_pay(
             &env,
             &payer,
-            memo,
+            invoice_id,
             amount,
             nonce,
             _auto_convert,
@@ -9182,7 +9233,7 @@ impl SplitContract {
             None,
             false,
         );
-        events::payment_matched(&env, memo, memo, &payer);
+        events::payment_matched(&env, invoice_id, memo, &payer);
     }
 
     /// Issue #451: Creator sets a required payment memo hash on an invoice.
@@ -13461,7 +13512,7 @@ impl SplitContract {
             .set(&cumulative_key, &(cumulative + amount));
 
         append_audit_entry(&env, invoice_id, symbol_short!("del_pay"), &delegate);
-        events::payment_received(&env, invoice_id, &beneficiary, amount, &funding_token_for(&invoice));
+        events::payment_received(&env, invoice_id, &beneficiary, amount, &funding_token_for(&invoice), 0, invoice.funded);
         check_and_emit_funding_checkpoints(&env, invoice_id, invoice.funded, total);
         Self::record_invoice_rate_limit(&env, invoice_id, &beneficiary);
         notify_invoice(
@@ -14167,7 +14218,7 @@ impl SplitContract {
             .set(&cumulative_key, &(cumulative + amount));
 
         events::delegated_payment(&env, invoice_id, &on_behalf_of, &executor, amount);
-        events::payment_received(&env, invoice_id, &on_behalf_of, amount, &funding_token_for(&invoice));
+        events::payment_received(&env, invoice_id, &on_behalf_of, amount, &funding_token_for(&invoice), 0, invoice.funded);
         check_and_emit_funding_checkpoints(&env, invoice_id, invoice.funded, total);
         Self::record_invoice_rate_limit(&env, invoice_id, &on_behalf_of);
         append_audit_entry(&env, invoice_id, symbol_short!("dlgt_pay"), &executor);

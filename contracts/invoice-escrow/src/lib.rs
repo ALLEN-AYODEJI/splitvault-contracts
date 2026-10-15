@@ -496,6 +496,13 @@ impl InvoiceEscrowContract {
     /// Callable by anyone once the deadline has passed and the invoice is not
     /// already released.
     ///
+    /// Because an invoice may have many payers, callers can refund them in
+    /// multiple batches: pass a subset of depositors per call.  The invoice
+    /// status remains `Active` (or `Pending`) while deposits remain outstanding
+    /// and transitions to `Refunded` only once `funded_amount` reaches zero,
+    /// i.e. every recorded deposit has been returned.  This prevents the first
+    /// batch from permanently locking out subsequent batches.
+    ///
     /// # Arguments
     /// * `invoice_id` — Target invoice.
     /// * `payers`     — List of payer addresses to refund in this call.
@@ -529,11 +536,20 @@ impl InvoiceEscrowContract {
                     .persistent()
                     .remove(&deposit_key(invoice_id, &payer));
                 token_client.transfer(&env.current_contract_address(), &payer, &amount);
+                // Issue #42: decrement funded_amount so the contract tracks
+                // how much remains to be refunded across batches.
+                invoice.funded_amount = invoice.funded_amount.saturating_sub(amount);
                 emit_refunded(&env, invoice_id, &payer, amount);
             }
         }
 
-        invoice.status = EscrowStatus::Refunded;
+        // Issue #42: only mark the invoice as fully refunded once all recorded
+        // deposits have been returned.  While deposits remain outstanding the
+        // status stays at its current value so subsequent batch calls are not
+        // rejected by the InvalidStatus guard above.
+        if invoice.funded_amount == 0 {
+            invoice.status = EscrowStatus::Refunded;
+        }
         save_invoice(&env, invoice_id, &invoice);
         Ok(())
     }

@@ -31,7 +31,7 @@
 //! Use [`migrate_persistent`] / [`migrate_instance`] when renaming a key
 //! between contract versions.
 
-use soroban_sdk::{contracttype, symbol_short, Address, Env, IntoVal, Symbol, TryFromVal, Val};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol, TryFromVal, Val};
 
 // ---------------------------------------------------------------------------
 // Enum 1 — Instance-tier singletons
@@ -275,6 +275,13 @@ pub enum CompoundKey {
     Template(Address, Symbol),
     TemplateVersion(Address, Symbol, u32),
     TemplateVersionCount(Address, Symbol),
+    /// Issue #39: memo deduplication hash — keyed by sha256(invoice_id || payer || memo).
+    /// Presence of this key indicates the (invoice_id, payer, memo) triple has
+    /// already been processed and subsequent identical submissions are replays.
+    MemoDedupe(BytesN<32>),
+    /// Issue #41: per-payer tip total for an invoice.  Only written when tip > 0
+    /// to avoid unnecessary ledger entries and persistent-storage rent charges.
+    TipTotal(u64, Address),
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +458,7 @@ mod tests {
         let env = Env::default();
         let addr = soroban_sdk::Address::generate(&env);
         let id = 1u64;
+        let dummy_hash: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
         let keys: &[CompoundKey] = &[
             CompoundKey::PendingPayout(id, addr.clone()),
             CompoundKey::Channel(id, addr.clone()),
@@ -462,6 +470,8 @@ mod tests {
             CompoundKey::ConfidentialPay(id, addr.clone()),
             CompoundKey::Delegation(id, addr.clone()),
             CompoundKey::PayerCooldown(id, addr.clone()),
+            CompoundKey::MemoDedupe(dummy_hash),
+            CompoundKey::TipTotal(id, addr.clone()),
         ];
         for i in 0..keys.len() {
             for j in (i + 1)..keys.len() {

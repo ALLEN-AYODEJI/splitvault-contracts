@@ -80,12 +80,26 @@ pub fn forward_configured(env: &Env, invoice_id: u64, forward_to: &Address) {
 
 /// Emitted when a payment is received toward an invoice.
 /// Topics: (split, paid, invoice_id)
-/// Data: (payer, amount, token, event_seq)
-pub fn payment_received(env: &Env, invoice_id: u64, payer: &Address, amount: i128, token: &Address) {
+/// Data: (payer, amount, token, tip, current_funded, event_seq)
+///
+/// `tip` is the supplementary tip included with this payment (0 when not
+/// applicable).  `current_funded` is the running total funded amount for the
+/// invoice *after* this payment has been applied, allowing off-chain indexers
+/// to track funding progress purely from the event stream without querying
+/// contract storage.
+pub fn payment_received(
+    env: &Env,
+    invoice_id: u64,
+    payer: &Address,
+    amount: i128,
+    token: &Address,
+    tip: i128,
+    current_funded: i128,
+) {
     let event_seq = next_seq(env, invoice_id);
     env.events().publish(
         (symbol_short!("split"), symbol_short!("paid"), invoice_id),
-        (payer.clone(), amount, token.clone(), event_seq),
+        (payer.clone(), amount, token.clone(), tip, current_funded, event_seq),
     );
 }
 
