@@ -3062,7 +3062,9 @@ impl SplitContract {
     /// Withdraw a contribution before the invoice is fully funded.
     /// Only permitted while the invoice is in Pending status (Open/PartiallyFunded).
     /// The caller receives exactly the amount they contributed, the contribution
-    /// storage entry is deleted, and `invoice.funded` is decremented.
+    /// storage entry is deleted, `invoice.funded` is decremented, and the payer's
+    /// entries are pruned from all payment shards so that a subsequent `refund`
+    /// call cannot issue a second refund for the same contribution (double-refund fix).
     pub fn withdraw_contribution(env: Env, payer: Address, invoice_id: u64) -> Result<(), ContractError> {
         payer.require_auth();
 
@@ -3084,6 +3086,32 @@ impl SplitContract {
 
         // Delete the contribution record.
         env.storage().persistent().remove(&contrib_key);
+
+        // Prune the payer's Payment entries from all shards so that a later
+        // `refund` call does not re-refund amounts already returned here.
+        for shard_id in 0..SHARD_COUNT {
+            if let Some(shard_payments) = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+            {
+                let mut new_shard_payments: Vec<Payment> = Vec::new(&env);
+                for payment in shard_payments.iter() {
+                    if payment.payer != payer {
+                        new_shard_payments.push_back(payment.clone());
+                    }
+                }
+                if new_shard_payments.is_empty() {
+                    env.storage()
+                        .persistent()
+                        .remove(&pay_shard_key(invoice_id, shard_id));
+                } else {
+                    env.storage()
+                        .persistent()
+                        .set(&pay_shard_key(invoice_id, shard_id), &new_shard_payments);
+                }
+            }
+        }
 
         // Decrease funded amount.
         invoice.funded = invoice.funded.saturating_sub(amount);
@@ -9123,6 +9151,12 @@ impl SplitContract {
 
     /// Create a treasury group linking multiple invoice IDs to a single treasury address.
     /// Returns the new group id.
+    ///
+    /// Security: only the creator (or a co-creator) of every invoice in `invoice_ids`
+    /// may call this function. Each invoice must be in Pending status and must not
+    /// already belong to an existing treasury group. These checks prevent an
+    /// unauthorized caller from hijacking release funds by redirecting payouts to
+    /// an attacker-controlled treasury address.
     pub fn group_treasury_create(
         env: Env,
         creator: Address,
@@ -9131,6 +9165,33 @@ impl SplitContract {
     ) -> u64 {
         require_not_paused(&env);
         creator.require_auth();
+
+        // Validate every invoice before writing any state.
+        for iid in invoice_ids.iter() {
+            let invoice = load_invoice(&env, iid);
+
+            // Only the invoice creator or a co-creator may bind this invoice to a treasury group.
+            assert!(
+                invoice.creator == creator
+                    || invoice.co_creators.iter().any(|c| c == creator),
+                "not invoice creator or co-creator"
+            );
+
+            // Invoice must be pending — released/refunded invoices cannot be re-grouped.
+            assert!(
+                invoice.status == InvoiceStatus::Pending,
+                "invoice not pending"
+            );
+
+            // Reject invoices that already belong to a treasury group.
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&invoice_treasury_key(iid)),
+                "invoice already in treasury group"
+            );
+        }
+
         let id: u64 = env
             .storage()
             .persistent()
@@ -12426,8 +12487,34 @@ impl SplitContract {
     /// `majority` — when `false` (default), all members must be fully funded before
     /// any can release (AllOrNothing). When `true`, a strict majority (>50%) being
     /// fully funded is sufficient to unblock release (Issue #212).
-    pub fn create_invoice_group(env: Env, invoice_ids: Vec<u64>, majority: bool) -> u64 {
+    ///
+    /// Security: `creator` must authenticate and must be the creator (or co-creator)
+    /// of every invoice being grouped. This prevents an unauthenticated attacker from
+    /// attaching arbitrary invoices to a group, which would permanently block
+    /// auto-release for those invoices (DoS).
+    pub fn create_invoice_group(env: Env, creator: Address, invoice_ids: Vec<u64>, majority: bool) -> u64 {
+        creator.require_auth();
         assert!(invoice_ids.len() >= 2, "group needs at least 2 invoices");
+
+        // Validate creator owns every invoice and that none are already grouped.
+        for id in invoice_ids.iter() {
+            let invoice = load_invoice(&env, id);
+
+            // Only the invoice creator or a co-creator may add the invoice to a group.
+            assert!(
+                invoice.creator == creator
+                    || invoice.co_creators.iter().any(|c| c == creator),
+                "not invoice creator or co-creator"
+            );
+
+            // Reject invoices already assigned to a group (prevents re-grouping).
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&invoice_group_key(id)),
+                "invoice already in a group"
+            );
+        }
 
         let grp_cnt_key = symbol_short!("grp_cnt");
         let group_id: u64 = env.storage().persistent().get(&grp_cnt_key).unwrap_or(0u64) + 1;
