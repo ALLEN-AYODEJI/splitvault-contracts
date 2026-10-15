@@ -3559,13 +3559,31 @@ impl SplitContract {
 
     /// Set an arbiter address for an invoice. Requires admin auth.
     /// Only the arbiter may raise and resolve disputes on this invoice.
+    /// Issue #12: Changing the arbiter is disallowed while a dispute is active to
+    /// prevent race conditions between the old and new arbiter's transactions.
     pub fn set_arbiter(env: Env, admin: Address, invoice_id: u64, arbiter: Address) {
         require_admin(&env);
         let _ = admin;
         let mut invoice = load_invoice(&env, invoice_id);
+        assert!(!invoice.disputed, "invoice is already disputed");
         invoice.arbiter = Some(arbiter.clone());
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("set_arb"), &arbiter);
+    }
+
+    /// Remove the arbiter from an invoice. Requires admin auth.
+    /// Issue #12: Provides a clean entry point to unset an arbiter on non-disputed invoices.
+    pub fn remove_arbiter(env: Env, admin: Address, invoice_id: u64) {
+        require_admin(&env);
+        let _ = admin;
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(!invoice.disputed, "invoice is already disputed");
+        let removed = invoice.arbiter.clone();
+        invoice.arbiter = None;
+        save_invoice(&env, invoice_id, &invoice);
+        if let Some(ref addr) = removed {
+            append_audit_entry(&env, invoice_id, symbol_short!("rem_arb"), addr);
+        }
     }
 
     /// Add a co-creator to an invoice. Only the primary creator may call this.
@@ -10439,6 +10457,8 @@ impl SplitContract {
                         success = true;
                     }
                 } else if invoice.smart_route {
+                    // Issue #14: Transfer via funding token exactly once.
+                    // The redundant secondary recipient_token_client.transfer has been removed.
                     let transfer_res = env.try_invoke_contract::<(), soroban_sdk::Error>(
                         &funding_token_client.address,
                         &symbol_short!("transfer"),
@@ -10447,18 +10467,6 @@ impl SplitContract {
                     if transfer_res.is_ok() {
                         success = true;
                     }
-                    let from_token = recipient_token_for(invoice, i as usize);
-                    let mut route_args: Vec<Val> = Vec::new(env);
-                    route_args.push_back(from_token.into_val(env));
-                    route_args.push_back(payout.into_val(env));
-                    route_args.push_back(recipient.clone().into_val(env));
-                    let recipient_token_client =
-                        token::Client::new(env, &recipient_token_for(invoice, i as usize));
-                    recipient_token_client.transfer(
-                        &env.current_contract_address(),
-                        &recipient,
-                        &payout,
-                    );
                 } else if invoice.convert_to_stream {
                     if let Some(stream_contract) = env
                         .storage()
@@ -10507,14 +10515,9 @@ impl SplitContract {
                             success = true;
                         }
                     } else {
+                        // Issue #14: execute_smart_route already transferred funds to
+                        // the recipient; do not execute a second transfer here.
                         success = true;
-                        let recipient_token_client =
-                            token::Client::new(env, &recipient_token_for(invoice, i as usize));
-                        recipient_token_client.transfer(
-                            &env.current_contract_address(),
-                            &recipient,
-                            &payout,
-                        );
                     }
                 }
 
@@ -10528,7 +10531,11 @@ impl SplitContract {
                 } else {
                     events::payout_initiated(env, invoice_id, i, &recipient, payout);
                 }
+            }
 
+            // Issue #13: Transfer total_tax to the tax authority exactly once,
+            // after the per-recipient loop completes, not on every iteration.
+            if total_tax > 0 {
                 if let Some(ref auth) = invoice.tax_authority {
                     funding_token_client.transfer(
                         &env.current_contract_address(),
@@ -15299,6 +15306,13 @@ impl SplitContract {
             "InvoiceDeleted"
         );
         assert!(invoice.creator == caller, "OnlyCreator");
+        // Issue #11: If a creator cosigner is configured, require its authentication
+        // in addition to the creator's, mirroring the pattern used in cancel_invoice.
+        // This prevents a creator from bypassing the multi-party governance requirement
+        // by simply nominating a new creator that has no cosigner attached.
+        if let Some(cos) = invoice.creator_cosigner.clone() {
+            cos.require_auth();
+        }
         env.storage()
             .persistent()
             .set(&pending_creator_key(invoice_id), &successor);
