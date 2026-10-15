@@ -80,13 +80,28 @@ pub fn distribute_with_remainder(
     let mut remainders = Vec::new(env);
 
     for r in ratios.iter() {
-        shares.push_back(total * r / denom);
-        remainders.push_back(total * r % denom);
+        // Upcast to u128 before multiplying to prevent i128 overflow on large
+        // total * r products. Both total and r are non-negative by contract
+        // preconditions (ratios come from basis-point weights). (#17)
+        let total_u = total as u128;
+        let r_u = r as u128;
+        let denom_u = denom as u128;
+        let num = total_u
+            .checked_mul(r_u)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        shares.push_back((num / denom_u) as i128);
+        remainders.push_back((num % denom_u) as i128);
     }
 
     // How many extra stroops to distribute?
     let distributed: i128 = shares.iter().sum();
-    let leftover = (total - distributed) as usize;
+    let leftover_i128 = total - distributed;
+    // Guard against a misconfigured denominator producing more leftover stroops
+    // than there are recipients — indexing `indices` past `n` would panic. (#17)
+    if leftover_i128 < 0 || leftover_i128 as usize > n {
+        return Err(ContractError::ArithmeticOverflow);
+    }
+    let leftover = leftover_i128 as usize;
 
     // Build an index array sorted by remainder descending.
     // We use a fixed-size array (max 64 recipients) for no_std compatibility.
@@ -464,5 +479,58 @@ mod tests {
         // i128::MAX * 2 overflows the intermediate multiplication
         let result = calc_platform_fee(i128::MAX, 2);
         assert_eq!(result, Err(crate::error::ContractError::ArithmeticOverflow));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #17: overflow safety tests for distribute_with_remainder
+    // -----------------------------------------------------------------------
+
+    /// total = i128::MAX / 2 with a large ratio must not overflow or panic. (#17)
+    #[test]
+    fn test_distribute_large_total_does_not_overflow() {
+        let env = Env::default();
+        let total = i128::MAX / 2;
+        // Split evenly between 2 recipients.
+        let ratios = make_ratios(&env, &[1, 1]);
+        let result = distribute_with_remainder(&env, total, &ratios, 2);
+        // Must succeed and produce correct sum.
+        let shares = result.expect("should not overflow for total = i128::MAX / 2");
+        let sum: i128 = shares.iter().sum();
+        assert_eq!(sum, total);
+    }
+
+    /// Very large total * ratio product that overflows u128 must return ArithmeticOverflow. (#17)
+    #[test]
+    fn test_distribute_overflow_returns_err() {
+        let env = Env::default();
+        // u128::MAX / i128 fits, but i128::MAX * i128::MAX overflows u128.
+        // Use total = i128::MAX and ratio = 2 with denom = 1 so num = i128::MAX * 2.
+        // i128::MAX * 2 = ~3.4e38 which overflows u128::MAX (~3.4e38) depending on exact value.
+        // i128::MAX = 2^127 - 1; i128::MAX * 2 = 2^128 - 2 > u128::MAX (2^128 - 1 is u128::MAX).
+        // 2^128 - 2 < 2^128 - 1 = u128::MAX, so this actually does NOT overflow u128.
+        // Use a ratio of 3 instead: i128::MAX * 3 > u128::MAX.
+        let total = i128::MAX;
+        let ratios = make_ratios(&env, &[3]);
+        let result = distribute_with_remainder(&env, total, &ratios, 1);
+        // total * 3 overflows u128; must return ArithmeticOverflow.
+        assert_eq!(result, Err(crate::error::ContractError::ArithmeticOverflow));
+    }
+
+    /// leftover must never exceed n (the recipient count). If it somehow would,
+    /// ArithmeticOverflow is returned to prevent out-of-bounds indexing. (#17)
+    #[test]
+    fn test_distribute_leftover_bounded_by_n() {
+        let env = Env::default();
+        // With well-formed inputs leftover < n always; verify a normal case still sums correctly.
+        let total = 7i128;
+        let ratios = make_ratios(&env, &[1, 1, 1]);
+        let shares = distribute_with_remainder(&env, total, &ratios, 3).unwrap();
+        let sum: i128 = shares.iter().sum();
+        assert_eq!(sum, total);
+        // Each share should be either 2 or 3.
+        for i in 0..3u32 {
+            let s = shares.get(i).unwrap();
+            assert!(s == 2 || s == 3);
+        }
     }
 }

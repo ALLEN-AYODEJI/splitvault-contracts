@@ -8688,3 +8688,128 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+// ---------------------------------------------------------------------------
+// Issue #15 — release_tranche must deduct platform fee and tax
+// ---------------------------------------------------------------------------
+
+/// Calling release_tranche directly with a 5% platform fee and 5% tax:
+/// treasury receives 5%, tax authority receives 5%, recipient receives 90%. (#15)
+#[test]
+fn test_release_tranche_deducts_platform_fee_and_tax() {
+    let (env, contract_id, token_id) = setup();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let tax_authority = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    // 5% platform fee (500 bps), treasury set.
+    c.initialize(&admin, &0_i128, &treasury, &token_id, &500_u32, &None, &0_u32, &0_u32, &0_u64);
+
+    // Two equal tranches of 50% each.
+    let mut tranches = Vec::new(&env);
+    tranches.push_back(types::Tranche { timestamp: 1_500, basis_points: 5_000 });
+    tranches.push_back(types::Tranche { timestamp: 2_500, basis_points: 5_000 });
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(&env);
+    amounts.push_back(1_000_i128);
+
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            tranches: tranches.clone(),
+            // 5% tax
+            tax_bps: Some(500),
+            tax_authority: Some(tax_authority.clone()),
+            ..default_options(&env)
+        },
+    );
+
+    c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
+
+    // Release tranche 0 directly via release_tranche (not the batch release()).
+    env.ledger().set_timestamp(1_600);
+    c.release_tranche(&id, &0_u32);
+
+    // Tranche 0 releases 50% of 1000 = 500 payout_raw.
+    // Platform fee: 500 * 5% = 25 → treasury.
+    // Tax: 500 * 5% = 25 → tax_authority.
+    // Net payout: 500 - 25 - 25 = 450 → recipient.
+    assert_eq!(tk.balance(&recipient), 450);
+    assert_eq!(tk.balance(&treasury), 25);
+    assert_eq!(tk.balance(&tax_authority), 25);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #16 — partial_release with priorities must not over-decrement funded
+// ---------------------------------------------------------------------------
+
+/// Fund invoice with 100. Call partial_release with priority where only 60 can
+/// be paid. Assert invoice.funded == 40 (not 0). (#16)
+#[test]
+fn test_partial_release_priority_only_decrements_actual_transferred() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let mut recipients = Vec::new(&env);
+    recipients.push_back(r1.clone());
+    recipients.push_back(r2.clone());
+    let mut amounts = Vec::new(&env);
+    // r1 requires 60, r2 requires 50.
+    amounts.push_back(60_i128);
+    amounts.push_back(50_i128);
+
+    // Priorities: r1 has priority 1 (paid first), r2 has priority 2 (paid second).
+    let mut priorities = Vec::new(&env);
+    priorities.push_back(1_u32);
+    priorities.push_back(2_u32);
+
+    let id = c.create_invoice(
+        &creator,
+        &recipients,
+        &amounts,
+        &token_id,
+        &9_999_u64,
+        &InvoiceOptions {
+            priorities: priorities.clone(),
+            ..default_options(&env)
+        },
+    );
+
+    // Fund invoice with 100.
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert_eq!(c.get_invoice(&id).funded, 100);
+
+    // Partial release of 100: r1 (60) is covered, r2 (50) is skipped (only 40 left).
+    // Only 60 should actually be transferred; funded should decrease by 60, leaving 40.
+    c.partial_release(&id, &creator, &100_i128);
+
+    let tk = token_client(&env, &token_id);
+    assert_eq!(tk.balance(&r1), 60);
+    assert_eq!(tk.balance(&r2), 0);
+    // invoice.funded must reflect actual tokens transferred, not the full requested amount.
+    assert_eq!(c.get_invoice(&id).funded, 40);
+}
+
