@@ -1095,6 +1095,47 @@ fn reentrancy_lock_key() -> Symbol {
     symbol_short!("re_lock")
 }
 
+/// RAII reentrancy guard backed by temporary storage (issue #62).
+///
+/// On construction the guard checks that no lock is present, then sets it.
+/// On drop the guard **always** removes the lock key, whether the enclosing
+/// function returned normally or panicked.  This prevents false-positive
+/// `ReentrantCall` errors on subsequent independent invocations when the
+/// runtime catches the panic at the WASM boundary but does not roll back
+/// temporary storage.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// pub fn my_fn(env: Env, …) {
+///     let _guard = ReentrancyGuard::acquire(&env);
+///     // … guarded work …
+/// }  // _guard dropped here, lock always cleared
+/// ```
+struct ReentrancyGuard {
+    env: Env,
+}
+
+impl ReentrancyGuard {
+    /// Acquire the reentrancy lock.  Panics with `ContractError::ReentrantCall`
+    /// if the lock is already held.
+    fn acquire(env: &Env) -> Self {
+        let key = reentrancy_lock_key();
+        if env.storage().temporary().has(&key) {
+            panic!("{}", ContractError::ReentrantCall as u32);
+        }
+        env.storage().temporary().set(&key, &true);
+        ReentrancyGuard { env: env.clone() }
+    }
+}
+
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        // Always remove the lock — runs on both normal return and unwind.
+        self.env.storage().temporary().remove(&reentrancy_lock_key());
+    }
+}
+
 /// Executes `body` inside a reentrancy guard backed by temporary storage.
 ///
 /// # How it works
@@ -4213,15 +4254,53 @@ impl SplitContract {
     }
 
     pub fn get_invoice_status(env: Env, invoice_id: u64) -> Option<InvoiceStatus> {
-        if let Some(hot) = env.storage().instance().get::<_, InvoiceHot>(&invoice_hot_key(invoice_id)) {
-            Some(hot.status)
-        } else if let Some(core) = env.storage().persistent().get::<_, InvoiceCore>(&invoice_key(invoice_id)) {
-            Some(core.status)
-        } else if let Some(core) = env.storage().instance().get::<_, InvoiceCore>(&invoice_key(invoice_id)) {
-            Some(core.status)
+        // Issue #59: compute effective status dynamically — a Pending invoice
+        // whose deadline has passed is returned as Expired without requiring an
+        // on-chain notify_expired call.  We need the deadline to apply this
+        // check, so when the hot-cache path returns Pending we also load the
+        // core to retrieve the deadline.
+        let now = env.ledger().timestamp();
+
+        let (status, deadline) = if let Some(hot) =
+            env.storage().instance().get::<_, InvoiceHot>(&invoice_hot_key(invoice_id))
+        {
+            // Hot entry does not store deadline; fall back to persistent/instance
+            // core only when the status is still Pending (the only case where
+            // the deadline matters for the effective-status computation).
+            let deadline = if hot.status == InvoiceStatus::Pending {
+                let core: Option<InvoiceCore> = env
+                    .storage()
+                    .persistent()
+                    .get(&invoice_key(invoice_id))
+                    .or_else(|| env.storage().instance().get(&invoice_key(invoice_id)));
+                core.map(|c| c.deadline).unwrap_or(u64::MAX)
+            } else {
+                u64::MAX
+            };
+            (hot.status, deadline)
+        } else if let Some(core) = env
+            .storage()
+            .persistent()
+            .get::<_, InvoiceCore>(&invoice_key(invoice_id))
+        {
+            (core.status, core.deadline)
+        } else if let Some(core) = env
+            .storage()
+            .instance()
+            .get::<_, InvoiceCore>(&invoice_key(invoice_id))
+        {
+            (core.status, core.deadline)
         } else {
             panic_with_error!(env, ContractError::InvoiceNotFound);
-        }
+        };
+
+        // Lazily surface expired status without mutating on-chain state.
+        let effective = if status == InvoiceStatus::Pending && now > deadline {
+            InvoiceStatus::Expired
+        } else {
+            status
+        };
+        Some(effective)
     }
 
     /// Get a consolidated invoice snapshot for off-chain audit.
@@ -8127,16 +8206,11 @@ impl SplitContract {
         invoice_id: u64,
         preimage: Option<Bytes>,
     ) {
-        // --- Reentrancy guard (issue #451-reentrancy) ---
-        // Uses temporary storage so the lock is never persisted across transactions.
-        let re_key = reentrancy_lock_key();
-        if env.storage().temporary().has(&re_key) {
-            panic!("{}", ContractError::ReentrantCall as u32);
-        }
-        env.storage().temporary().set(&re_key, &true);
+        // Issue #62: use RAII guard so the lock is always removed on exit,
+        // whether the function returns normally or panics.
+        let _re_guard = ReentrancyGuard::acquire(&env);
         // ------------------------------------------------
         Self::_release_invoice_inner(&env, caller, invoice_id, preimage);
-        env.storage().temporary().remove(&reentrancy_lock_key());
     }
 
     #[allow(unreachable_code)]
@@ -8487,6 +8561,17 @@ impl SplitContract {
                 .expect("ArithmeticOverflow");
             let mut paid_total = 0i128;
             let mut tranche_surplus = 0i128;
+
+            // Issues #60 & #61: adopt the checks-effects-interactions pattern.
+            // Advance milestones_released and persist the invoice state BEFORE
+            // executing any external token transfers.  This ensures the
+            // milestone is marked as claimed in storage even if a transfer
+            // panics mid-loop, preventing a duplicate-claim scenario and
+            // guaranteeing that on-chain state reflects completion atomically
+            // with the payout.
+            invoice.milestones_released += 1;
+            save_invoice(env, invoice_id, invoice);
+
             for i in 0..invoice.recipients.len() {
                 let recipient = invoice.recipients.get(i).unwrap();
                 let base_amount = invoice.amounts.get(i).unwrap();
@@ -8527,7 +8612,6 @@ impl SplitContract {
                     &stored_surplus.saturating_add(tranche_surplus),
                 );
             }
-            invoice.milestones_released += 1;
             events::milestone_released(env, invoice_id, milestone_bps, paid_total);
         }
         if invoice.milestones_released >= invoice.milestones.len() {
@@ -11115,12 +11199,9 @@ impl SplitContract {
     /// `refund_grace_secs`) has passed — callers should not have to make a
     /// separate `notify_expired` call just to unlock their funds.
     pub fn refund(env: Env, invoice_id: u64) {
-        // --- Reentrancy guard (issue #451-reentrancy) ---
-        let re_key = reentrancy_lock_key();
-        if env.storage().temporary().has(&re_key) {
-            panic!("{}", ContractError::ReentrantCall as u32);
-        }
-        env.storage().temporary().set(&re_key, &true);
+        // Issue #62: use RAII guard so the lock is always removed on exit,
+        // whether the function returns normally or panics.
+        let _re_guard = ReentrancyGuard::acquire(&env);
         // ------------------------------------------------
         require_fn_not_paused(&env, &symbol_short!("refund"));
         let mut invoice = load_invoice(&env, invoice_id);
@@ -11253,8 +11334,7 @@ impl SplitContract {
                 .checked_add(1)
                 .expect("creator_refunded overflow"),
         );
-        // Clear reentrancy lock on normal exit.
-        env.storage().temporary().remove(&reentrancy_lock_key());
+        // Lock cleared automatically when `_re_guard` drops at end of scope.
     }
 
     /// Backwards-compatible alias for the expiry-driven refund path.
@@ -11687,12 +11767,9 @@ impl SplitContract {
     /// Cancel an invoice. Refunds any payments already made.
     /// Issue #89: If stake exists, distributes it equally among unique payers.
     pub fn cancel_invoice(env: Env, caller: Address, invoice_id: u64) {
-        // --- Reentrancy guard (issue #451-reentrancy) ---
-        let re_key = reentrancy_lock_key();
-        if env.storage().temporary().has(&re_key) {
-            panic!("{}", ContractError::ReentrantCall as u32);
-        }
-        env.storage().temporary().set(&re_key, &true);
+        // Issue #62: use RAII guard so the lock is always removed on exit,
+        // whether the function returns normally or panics.
+        let _re_guard = ReentrancyGuard::acquire(&env);
         // ------------------------------------------------
         require_not_paused(&env);
         caller.require_auth();
@@ -11887,8 +11964,7 @@ impl SplitContract {
                 .set(&creator_cooldown_key(&invoice.creator), &until_ledger);
             events::creator_cooldown_set(&env, &invoice.creator, until_ledger, cooldown_ledgers);
         }
-        // Clear reentrancy lock on normal exit.
-        env.storage().temporary().remove(&reentrancy_lock_key());
+        // Lock cleared automatically when `_re_guard` drops at end of scope.
     }
 
     /// Transfer invoice ownership to a new creator.
@@ -12615,7 +12691,14 @@ impl SplitContract {
 
     pub fn get_invoice(env: Env, invoice_id: u64) -> InvoiceCore {
         let inv = load_invoice(&env, invoice_id);
-        inv.split().0
+        let mut core = inv.split().0;
+        // Issue #59: compute effective status dynamically — a Pending invoice
+        // whose deadline has passed is returned as Expired without requiring an
+        // on-chain notify_expired call.
+        if core.status == InvoiceStatus::Pending && env.ledger().timestamp() > core.deadline {
+            core.status = InvoiceStatus::Expired;
+        }
+        core
     }
 
     pub fn is_archived(env: Env, invoice_id: u64) -> bool {

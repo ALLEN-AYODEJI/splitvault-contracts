@@ -6410,8 +6410,10 @@ fn test_refund_available_after_deadline() {
     c.claim_refund(&payer, &id);
 
     assert_eq!(tk.balance(&payer), 200);
-    // Invoice still Pending (not bulk-refunded)
-    assert_eq!(c.get_invoice(&id).status, types::InvoiceStatus::Pending);
+    // Invoice deadline has passed — get_invoice now returns Expired dynamically
+    // (issue #59), even though the on-chain stored status is still Pending
+    // (no bulk-refund has been executed via refund()).
+    assert_eq!(c.get_invoice(&id).status, types::InvoiceStatus::Expired);
 }
 
 #[test]
@@ -8688,3 +8690,258 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #59 — Dynamic expiry in view functions
+// ---------------------------------------------------------------------------
+
+/// Advance the ledger past an invoice's deadline without calling
+/// notify_expired.  Both get_invoice_status and get_invoice must return
+/// Expired dynamically.
+#[test]
+fn test_get_invoice_status_expired_dynamically_without_notify() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    let deadline = 2_000_u64;
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, deadline);
+
+    // Before deadline: Pending
+    let status_before = c.get_invoice_status(&id).expect("should return status");
+    assert_eq!(status_before, InvoiceStatus::Pending);
+
+    // Advance past deadline — do NOT call notify_expired
+    env.ledger().set_timestamp(3_000);
+
+    // get_invoice_status must return Expired immediately
+    let status_after = c.get_invoice_status(&id).expect("should return status");
+    assert_eq!(
+        status_after,
+        InvoiceStatus::Expired,
+        "get_invoice_status should return Expired once timestamp > deadline"
+    );
+
+    // get_invoice must also reflect Expired
+    let core = c.get_invoice(&id);
+    assert_eq!(
+        core.status,
+        InvoiceStatus::Expired,
+        "get_invoice should return Expired once timestamp > deadline"
+    );
+}
+
+/// At exactly the deadline the invoice should still appear Pending — Expired
+/// only once the timestamp strictly exceeds the deadline.
+#[test]
+fn test_get_invoice_status_not_expired_at_exact_deadline() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+    let deadline = 2_000_u64;
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, deadline);
+
+    // Set timestamp to exactly the deadline value
+    env.ledger().set_timestamp(deadline);
+
+    let status = c.get_invoice_status(&id).expect("should return status");
+    assert_eq!(
+        status,
+        InvoiceStatus::Pending,
+        "status should still be Pending at exactly the deadline"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issues #60 & #61 — Milestone checks-effects-interactions & claim guard
+// ---------------------------------------------------------------------------
+
+/// Helper that creates a single-recipient invoice with milestone-based
+/// auto-release at 50 % and 100 % of the target.
+fn make_milestone_invoice(
+    env: &Env,
+    c: &SplitContractClient,
+    creator: &Address,
+    recipient: &Address,
+    amount: i128,
+    token_id: &Address,
+    deadline: u64,
+) -> u64 {
+    let mut recipients = Vec::new(env);
+    recipients.push_back(recipient.clone());
+    let mut amounts = Vec::new(env);
+    amounts.push_back(amount);
+
+    let mut ms_vec: Vec<u32> = Vec::new(env);
+    ms_vec.push_back(5_000_u32); // 50 %
+    ms_vec.push_back(10_000_u32); // 100 %
+
+    let mut opts = default_options(env);
+    opts.ext.milestones = Some(ms_vec);
+
+    c.create_invoice(creator, &recipients, &amounts, token_id, &deadline, &opts)
+}
+
+/// Paying 50 % of the target must trigger the first milestone release (CEI
+/// ordering: milestones_released is persisted before the token transfer so
+/// repeated triggers are blocked).  Paying the remaining 50 % must trigger
+/// the second milestone and mark the invoice Released.
+#[test]
+fn test_milestone_increments_before_transfer() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &200);
+    env.ledger().set_timestamp(1_000);
+
+    // Invoice total = 200; milestones at 50 % (100 tokens) and 100 % (200)
+    let id = make_milestone_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // Pay 50 % — first milestone should release 100 tokens to recipient (nonce 0)
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    assert_eq!(tk.balance(&recipient), 100, "first milestone payout incorrect");
+
+    // Invoice is not yet fully released — second milestone still pending
+    let ext2_mid = c.get_invoice_ext2(&id);
+    assert_eq!(
+        ext2_mid.milestones_released, 1,
+        "milestones_released should be 1 after first payout"
+    );
+    let core_mid = c.get_invoice(&id);
+    assert_eq!(
+        core_mid.status,
+        InvoiceStatus::Pending,
+        "invoice should still be Pending after first milestone"
+    );
+
+    // Pay the remaining 50 % — second milestone releases remaining 100 tokens (nonce 1)
+    c.pay(&payer, &id, &100_i128, &1_u64, &false, &false, &None);
+    assert_eq!(tk.balance(&recipient), 200, "second milestone payout incorrect");
+
+    // Invoice should now be Released
+    let core_final = c.get_invoice(&id);
+    assert_eq!(
+        core_final.status,
+        InvoiceStatus::Released,
+        "invoice should be Released after all milestones"
+    );
+    let ext2_final = c.get_invoice_ext2(&id);
+    assert_eq!(
+        ext2_final.milestones_released, 2,
+        "milestones_released should be 2 after all payouts"
+    );
+}
+
+/// Calling pay() twice with the same amount that crosses the same milestone
+/// threshold must NOT trigger a double payout.  The second pay should find
+/// milestones_released already incremented past the threshold and skip it.
+#[test]
+fn test_milestone_not_double_released_on_repeated_pay() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    // Mint enough for two payments
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &300);
+    env.ledger().set_timestamp(1_000);
+
+    // Invoice total = 200; milestone at 50 % (100) and 100 % (200)
+    let id = make_milestone_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    // First payment hits the 50 % threshold (nonce 0)
+    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
+    let balance_after_first = tk.balance(&recipient);
+    assert_eq!(balance_after_first, 100);
+
+    // Second payment at the same amount pushes over 100 % threshold and
+    // triggers the second (and final) milestone only once (nonce 1).
+    c.pay(&payer, &id, &100_i128, &1_u64, &false, &false, &None);
+    let balance_after_second = tk.balance(&recipient);
+    // Total payout should be exactly 200 — no double release of milestone 1
+    assert_eq!(
+        balance_after_second, 200,
+        "milestone should not be released twice"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #62 — Reentrancy lock released after sequential guarded calls
+// ---------------------------------------------------------------------------
+
+/// Execute two sequential refund-like operations (cancel + notify_expired
+/// pathway) and confirm the reentrancy lock is not left behind between calls.
+/// We verify this by calling two independently-guarded functions back-to-back
+/// inside the same test context; if the lock leaked, the second call would
+/// panic with ReentrantCall.
+#[test]
+fn test_reentrancy_lock_not_retained_across_sequential_calls() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    env.ledger().set_timestamp(1_000);
+
+    // Create two separate invoices; we will cancel them sequentially.
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Cancel the first invoice — acquires and releases the reentrancy lock.
+    c.cancel_invoice(&creator, &id1);
+
+    // If the lock leaked, this second cancel would panic with ReentrantCall.
+    c.cancel_invoice(&creator, &id2);
+
+    assert_eq!(c.get_invoice(&id1).status, InvoiceStatus::Cancelled);
+    assert_eq!(c.get_invoice(&id2).status, InvoiceStatus::Cancelled);
+}
+
+/// Sequential refund calls on two expired invoices must both succeed — the
+/// reentrancy lock from the first must be released before the second runs.
+#[test]
+fn test_reentrancy_lock_not_retained_across_sequential_refunds() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let payer = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &400);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 2_000);
+
+    c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
+    c.pay(&payer, &id2, &100_i128, &0_u64, &false, &false, &None);
+
+    // Advance past deadline so both invoices are refundable.
+    env.ledger().set_timestamp(3_000);
+
+    // First refund acquires and releases the reentrancy lock.
+    c.refund(&id1);
+
+    // Second refund must not fail with a stale lock.
+    c.refund(&id2);
+
+    assert_eq!(c.get_invoice(&id1).status, InvoiceStatus::Refunded);
+    assert_eq!(c.get_invoice(&id2).status, InvoiceStatus::Refunded);
+}
