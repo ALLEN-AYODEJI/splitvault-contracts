@@ -5443,6 +5443,22 @@ impl SplitContract {
         if let Err(e) = assert_valid_bps(penalty_bps) {
             env.panic_with_error(e);
         }
+        // Issue #7: When `penalty_bps > 0` a meaningful `penalty_deadline` is
+        // required.  A deadline of 0 is indistinguishable from "unset" and,
+        // because every ledger timestamp is positive, would cause the late-
+        // penalty check in `_pay` to fire on the very first payment — even one
+        // made immediately after creation.  Reject the configuration before any
+        // storage is written.
+        if penalty_bps > 0 {
+            assert!(
+                penalty_deadline > 0,
+                "penalty_deadline must be set when penalty_bps > 0"
+            );
+            assert!(
+                penalty_deadline <= deadline,
+                "penalty_deadline must not exceed invoice deadline"
+            );
+        }
         assert!(min_funding_bps <= 10_000, "min_funding_bps must be ≤ 10000");
         // Issue #695: velocity_limit > 0 paired with velocity_window == 0 would cause
         // division-by-zero or undefined behaviour when computing per-payer spend rates.
@@ -5500,14 +5516,14 @@ impl SplitContract {
 
         let _total_amount: i128 = amounts.iter().sum();
 
-        // Issue #286: Verify no duplicate recipients
-        for i in 0..recipients.len() {
-            for j in (i + 1)..recipients.len() {
-                debug_assert!(
-                    recipients.get(i).unwrap() != recipients.get(j).unwrap(),
-                    "invariant: duplicate recipient addresses in list"
-                );
-            }
+        // Issue #286 / #9: Reject duplicate recipients in all build profiles,
+        // including release builds.  The previous `debug_assert!` loop was
+        // compiled out when `debug-assertions = false`, so duplicates slipped
+        // through in WASM deployments.  `validation::assert_unique_recipients`
+        // is an always-active O(n log n) guard that panics with
+        // `ContractError::DuplicateRecipient` when a duplicate is found.
+        if let Err(e) = validation::assert_unique_recipients(env, &recipients) {
+            env.panic_with_error(e);
         }
 
         if let Some(compliance_contract) = env
@@ -7348,7 +7364,42 @@ impl SplitContract {
             (credited_amount as u128 * invoice.insurance_premium_bps as u128 / 10_000u128) as i128;
         // Transfer the full amount from payer so excess can be refunded/donated.
         let excess = amount - credited_amount;
-        let total_charge = credited_amount + premium + excess;
+
+        // Issue #8: Pre-compute any late-payment penalty so it can be included
+        // in the single token transfer from payer to contract.  Pulling the
+        // penalty separately from the payer (as the old code did) caused a
+        // double-debit: `total_charge` already moved `amount` out of the
+        // payer's account, and then a second `transfer(payer, &recipient, …)`
+        // was attempted on top, which either reverted (if the payer had no
+        // surplus funds) or charged them twice.  By absorbing the penalty into
+        // `total_charge` here we make the contract the single source of funds
+        // for the subsequent per-recipient distributions.
+        let late_penalty_amount: i128 =
+            if invoice.penalty_deadline > 0
+                && env.ledger().timestamp() > invoice.penalty_deadline
+            {
+                let penalty_bps: u32 = if !invoice.penalty_tiers.is_empty() {
+                    let elapsed = env.ledger().timestamp() - invoice.penalty_deadline;
+                    let mut matched_bps = 0u32;
+                    for tier in invoice.penalty_tiers.iter() {
+                        if elapsed >= tier.seconds_after_deadline {
+                            matched_bps = tier.bps;
+                        }
+                    }
+                    matched_bps
+                } else {
+                    invoice.penalty_bps
+                };
+                if penalty_bps > 0 {
+                    (amount as u128 * penalty_bps as u128 / 10_000u128) as i128
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+        let total_charge = credited_amount + premium + excess + late_penalty_amount;
         token_client.transfer(payer, &env.current_contract_address(), &total_charge);
         // Issue #420: `ReturnSurplus` refunds the uncredited remainder immediately,
         // regardless of the legacy `overflow_behavior` setting.
@@ -7404,7 +7455,14 @@ impl SplitContract {
         invoice.insurance_fund += premium;
 
         // Penalty for late payment (issues #42, #211).
-        if env.ledger().timestamp() > invoice.penalty_deadline {
+        // Issue #7: Guard `penalty_deadline > 0` so that invoices created with
+        // `penalty_bps = 0` (or any invoice whose penalty_deadline is unset)
+        // never trigger the penalty path, regardless of the current timestamp.
+        // Issue #8: `late_penalty_amount` was already included in the single
+        // `total_charge` transfer from payer to contract above.  Distribute it
+        // from `env.current_contract_address()` to each recipient so the payer
+        // is only debited once for the full obligation.
+        if late_penalty_amount > 0 {
             let penalty_bps: u32 = if !invoice.penalty_tiers.is_empty() {
                 let elapsed = env.ledger().timestamp() - invoice.penalty_deadline;
                 let mut matched_bps = 0u32;
@@ -7417,35 +7475,32 @@ impl SplitContract {
             } else {
                 invoice.penalty_bps
             };
-            if penalty_bps > 0 {
-                let penalty_amount = (amount as u128 * penalty_bps as u128 / 10_000u128) as i128;
-                if penalty_amount > 0 {
-                    let total_amounts: i128 = invoice.amounts.iter().sum();
-                    let mut distributed: i128 = 0;
-                    let n = invoice.recipients.len();
-                    for i in 0..n {
-                        let recipient = invoice.recipients.get(i).unwrap();
-                        let amt = invoice.amounts.get(i).unwrap();
-                        let share = if i == n - 1 {
-                            penalty_amount - distributed
-                        } else {
-                            (penalty_amount as u128 * amt as u128 / total_amounts as u128) as i128
-                        };
-                        distributed += share;
-                        if share > 0 {
-                            token_client.transfer(payer, &recipient, &share);
-                        }
-                    }
-                    // Issue #687: surface the late-payment penalty deduction.
-                    events::penalty_applied(
-                        env,
-                        invoice_id,
-                        payer,
-                        penalty_amount,
-                        penalty_bps,
-                    );
+            let total_amounts: i128 = invoice.amounts.iter().sum();
+            let mut distributed: i128 = 0;
+            let n = invoice.recipients.len();
+            for i in 0..n {
+                let recipient = invoice.recipients.get(i).unwrap();
+                let amt = invoice.amounts.get(i).unwrap();
+                let share = if i == n - 1 {
+                    late_penalty_amount - distributed
+                } else {
+                    (late_penalty_amount as u128 * amt as u128 / total_amounts as u128) as i128
+                };
+                distributed += share;
+                if share > 0 {
+                    // Transfer from contract, not from payer — the penalty was
+                    // already collected as part of `total_charge` above.
+                    token_client.transfer(&env.current_contract_address(), &recipient, &share);
                 }
             }
+            // Issue #687: surface the late-payment penalty deduction.
+            events::penalty_applied(
+                env,
+                invoice_id,
+                payer,
+                late_penalty_amount,
+                penalty_bps,
+            );
         }
 
         // Write payment to sharded storage (issue #177).
