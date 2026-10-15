@@ -966,6 +966,12 @@ fn surplus_claim_key(invoice_id: u64, payer: &Address) -> (Symbol, u64, Address)
     (symbol_short!("sur_clm"), invoice_id, payer.clone())
 }
 
+/// Tracks cumulative surplus already distributed for an invoice, used by
+/// `claim_surplus` to assign integer-division remainder dust to the last claimer.
+fn surplus_distributed_key(invoice_id: u64) -> (Symbol, u64) {
+    (symbol_short!("sur_dist"), invoice_id)
+}
+
 /// Issue #485: per-invoice contributor allowlist — persistent storage.
 #[allow(dead_code)]
 fn contributor_allowlist_key(invoice_id: u64) -> (Symbol, u64) {
@@ -7307,36 +7313,40 @@ impl SplitContract {
         // would push `funded` past `total`. `Cap` — the default and the value all
         // pre-#420 invoices carry — delegates to the legacy `overflow_behavior`
         // setting so existing invoices behave exactly as before.
+        //
+        // Issue #19: use `_credited_amount` (the flushed accumulator total) rather
+        // than the raw `amount` (last micro-payment only) so that all accumulated
+        // micro-payments are correctly credited.
         let credited_amount = match invoice.overfunding_policy {
-            // Credit the full payment. `funded` may exceed `total`; the surplus is
-            // distributed pro-rata at release because `_release_full` apportions
-            // `funded` (not `total`) across recipients.
-            OverfundingPolicy::AcceptAll => amount,
+            // Credit the full flushed amount. `funded` may exceed `total`; the
+            // surplus is distributed pro-rata at release because `_release_full`
+            // apportions `funded` (not `total`) across recipients.
+            OverfundingPolicy::AcceptAll => _credited_amount,
             // Credit only what fits under the target; the remainder is transferred
             // straight back to the payer below.
             OverfundingPolicy::ReturnSurplus => {
                 // `remaining` can be negative if an earlier `AcceptAll` phase
                 // overshot the target, so clamp before comparing.
-                amount.min(remaining.max(0))
+                _credited_amount.min(remaining.max(0))
             }
             OverfundingPolicy::Cap => match invoice.overflow_behavior {
                 OverflowBehavior::Reject => {
                     assert!(
-                        amount <= remaining,
+                        _credited_amount <= remaining,
                         "InvoiceFullyFunded: payment exceeds remaining balance"
                     );
-                    amount
+                    _credited_amount
                 }
                 OverflowBehavior::Refund => {
-                    if amount <= remaining {
-                        amount
+                    if _credited_amount <= remaining {
+                        _credited_amount
                     } else {
                         remaining
                     }
                 }
                 OverflowBehavior::Donate => {
-                    if amount <= remaining {
-                        amount
+                    if _credited_amount <= remaining {
+                        _credited_amount
                     } else {
                         remaining
                     }
@@ -7346,8 +7356,10 @@ impl SplitContract {
 
         let premium =
             (credited_amount as u128 * invoice.insurance_premium_bps as u128 / 10_000u128) as i128;
-        // Transfer the full amount from payer so excess can be refunded/donated.
-        let excess = amount - credited_amount;
+        // Transfer the full accumulated amount from payer; excess (above cap) is
+        // returned or donated. Using `_credited_amount` here ensures the payer
+        // covers all prior micro-payments that were accumulated without transfer.
+        let excess = _credited_amount - credited_amount;
         let total_charge = credited_amount + premium + excess;
         token_client.transfer(payer, &env.current_contract_address(), &total_charge);
         // Issue #420: `ReturnSurplus` refunds the uncredited remainder immediately,
@@ -9513,16 +9525,81 @@ impl SplitContract {
         let total_contributions: i128 = invoice.payments.iter().map(|payment| payment.amount).sum();
         assert!(total_contributions > 0, "no contributions recorded");
 
-        let refund_amount =
+        // Issue #22: compute proportional share and track cumulative distributed
+        // amount so integer-division remainder dust is absorbed by the last claimer
+        // rather than being permanently locked in the contract balance.
+        let already_distributed: i128 = env
+            .storage()
+            .persistent()
+            .get(&surplus_distributed_key(invoice_id))
+            .unwrap_or(0);
+        let remaining_surplus = surplus_total - already_distributed;
+        assert!(remaining_surplus > 0, "surplus fully distributed");
+
+        let proportional_share =
             (surplus_total as u128 * payer_total as u128 / total_contributions as u128) as i128;
+
+        // Determine whether this is the last eligible claimer: count unique
+        // contributors and compare against how many have already claimed
+        // (including this one). If this is the last claim, absorb any dust.
+        let unique_contributors: u32 = {
+            let mut seen: Vec<Address> = Vec::new(&env);
+            for p in invoice.payments.iter() {
+                if !seen.iter().any(|s| s == p.payer) {
+                    seen.push_back(p.payer.clone());
+                }
+            }
+            seen.len()
+        };
+
+        // Count how many unique contributors have already claimed.
+        let claimed_count: u32 = {
+            let mut count: u32 = 0;
+            let mut seen: Vec<Address> = Vec::new(&env);
+            for p in invoice.payments.iter() {
+                if seen.iter().any(|s| s == p.payer) {
+                    continue;
+                }
+                seen.push_back(p.payer.clone());
+                if env
+                    .storage()
+                    .persistent()
+                    .has(&surplus_claim_key(invoice_id, &p.payer))
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+        let is_last_claimer = claimed_count + 1 >= unique_contributors;
+
+        // Last claimer gets the full remaining balance to capture any dust.
+        let refund_amount = if is_last_claimer {
+            remaining_surplus
+        } else {
+            proportional_share.min(remaining_surplus)
+        };
         assert!(refund_amount > 0, "no surplus claimable");
 
         let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
         token_client.transfer(&env.current_contract_address(), &payer, &refund_amount);
+
         env.storage()
             .persistent()
             .set(&surplus_claim_key(invoice_id, &payer), &refund_amount);
+        env.storage().persistent().set(
+            &surplus_distributed_key(invoice_id),
+            &(already_distributed + refund_amount),
+        );
+
         events::surplus_claimed(&env, invoice_id, &payer, refund_amount);
+
+        // Emit a remainder event when the last claimer absorbs dust that would
+        // otherwise have been locked in the contract balance.
+        if is_last_claimer && refund_amount > proportional_share {
+            let dust = refund_amount - proportional_share;
+            events::surplus_remainder_credited(&env, invoice_id, &payer, dust);
+        }
     }
 
     /// Distribute tranches unlocked by the current ledger time (issue #23).
@@ -9926,19 +10003,9 @@ impl SplitContract {
         let amount_released =
             ((stage_bps as u128).saturating_mul(funded as u128) / 10_000u128) as i128;
 
-        // Increment total_volume and total_released counters (issue #28).
-        let total_volume: i128 = env
-            .storage()
-            .persistent()
-            .get(&total_volume_key())
-            .unwrap_or(0i128);
-        env.storage().persistent().set(
-            &total_volume_key(),
-            &total_volume
-                .checked_add(amount_released)
-                .expect("total_volume overflow"),
-        );
-
+        // Issue #21: only increment total_released here; total_volume is already
+        // incremented when payments are received in _pay, so incrementing it again
+        // during stage_release would double-count volume for staged invoices.
         let total_released: i128 = env
             .storage()
             .persistent()
@@ -10107,6 +10174,35 @@ impl SplitContract {
 
         let funded = invoice.funded;
 
+        // Issue #20: compute and transfer protocol fee first so that the
+        // distributable amount for recipients is reduced by exactly proto_fee_amount,
+        // preventing a balance shortfall on the final recipient's transfer.
+        let proto_fee_amount: i128 = if let Some(proto_cfg) =
+            env.storage()
+                .instance()
+                .get::<Symbol, ProtocolFeeConfig>(&protocol_fee_key())
+        {
+            if proto_cfg.rate_bps > 0 {
+                let fee = checked_bps_of(funded, proto_cfg.rate_bps, 10_000u128)
+                    .expect("ArithmeticOverflow");
+                if fee > 0 {
+                    funding_token_client.transfer(
+                        &env.current_contract_address(),
+                        &proto_cfg.treasury,
+                        &fee,
+                    );
+                    events::fee_paid(env, invoice_id, fee, &proto_cfg.treasury);
+                }
+                fee
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        // Amount available for recipients after protocol fee is taken.
+        let distributable = funded - proto_fee_amount;
+
         // First-party trusted callers (e.g. governance contracts) are exempt from the platform fee.
         // Deliberately does NOT match on `env.current_contract_address()`: `release()` and
         // `trigger_scheduled_release()` are permissionless entry points that pass the contract's
@@ -10125,8 +10221,9 @@ impl SplitContract {
             0
         } else {
             // Issue #489: early-bird contributions accrue a fee discount at
-            // payment time; apply it against the fee computed on the full total.
-            (Self::compute_fee(env.clone(), funded) - invoice.early_bird_fee_credit).max(0)
+            // payment time; apply it against the fee computed on the distributable
+            // amount (funded minus protocol fee) so fees don't exceed available funds.
+            (Self::compute_fee(env.clone(), distributable) - invoice.early_bird_fee_credit).max(0)
         };
 
         let total: i128 = invoice.amounts.iter().sum();
@@ -10203,13 +10300,13 @@ impl SplitContract {
                     SplitRule::Fixed(fixed_amt) => fixed_amt,
                     SplitRule::Percentage(bps) => {
                         // Issue #482: use checked arithmetic to prevent overflow.
-                        checked_bps_of(funded, bps, 10_000u128)
+                        checked_bps_of(distributable, bps, 10_000u128)
                             .expect("ArithmeticOverflow")
                     }
                     SplitRule::Tiered(threshold, bps) => {
-                        if funded > threshold {
+                        if distributable > threshold {
                             // Issue #482: use checked arithmetic to prevent overflow.
-                            checked_bps_of(funded, bps, 10_000u128)
+                            checked_bps_of(distributable, bps, 10_000u128)
                                 .expect("ArithmeticOverflow")
                         } else {
                             0
@@ -10217,10 +10314,10 @@ impl SplitContract {
                     }
                 }
             } else if i == last_unpaid_idx {
-                funded - distributed
+                distributable - distributed
             } else {
                 // Issue #482: use checked arithmetic to prevent overflow.
-                checked_proportion(amount as u128, funded as u128, effective_total as u128)
+                checked_proportion(amount as u128, distributable as u128, effective_total as u128)
                     .expect("ArithmeticOverflow")
             };
             let capped_proportional = if !invoice.recipient_max_payouts.is_empty() {
@@ -10257,11 +10354,11 @@ impl SplitContract {
             let post_tax = capped_proportional - tax;
 
             let is_waived = waivers.iter().any(|a| a == recipient);
-            let fee = if is_waived || funded == 0 {
+            let fee = if is_waived || distributable == 0 {
                 0
             } else {
                 // Issue #482: use checked arithmetic to prevent overflow.
-                checked_proportion(post_tax as u128, total_platform_fee as u128, funded as u128)
+                checked_proportion(post_tax as u128, total_platform_fee as u128, distributable as u128)
                     .expect("ArithmeticOverflow")
             };
             total_fee += fee;
@@ -10292,32 +10389,6 @@ impl SplitContract {
                 &stored_surplus.saturating_add(surplus_total),
             );
         }
-
-        // Issue #326: deduct protocol fee from the release amount before distributing.
-        let proto_fee_amount: i128 = if let Some(proto_cfg) =
-            env.storage()
-                .instance()
-                .get::<Symbol, ProtocolFeeConfig>(&protocol_fee_key())
-        {
-            if proto_cfg.rate_bps > 0 {
-                let fee = checked_bps_of(funded, proto_cfg.rate_bps, 10_000u128)
-                    .expect("ArithmeticOverflow"); // Issue #482
-                if fee > 0 {
-                    funding_token_client.transfer(
-                        &env.current_contract_address(),
-                        &proto_cfg.treasury,
-                        &fee,
-                    );
-                    events::fee_paid(env, invoice_id, fee, &proto_cfg.treasury);
-                }
-                fee
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        let _ = proto_fee_amount;
 
         // If this invoice belongs to a treasury group, route the net payouts to the group's treasury address.
         if let Some((_group_id, record)) = treasury_record_for_invoice(env, invoice_id) {
@@ -10408,11 +10479,11 @@ impl SplitContract {
                 let post_tax = proportional - tax;
 
                 let is_waived = waivers.iter().any(|a| a == recipient);
-                let fee = if is_waived || funded == 0 {
+                let fee = if is_waived || distributable == 0 {
                     0
                 } else {
                     // Issue #482: use checked arithmetic to prevent overflow.
-                    checked_proportion(post_tax as u128, total_platform_fee as u128, funded as u128)
+                    checked_proportion(post_tax as u128, total_platform_fee as u128, distributable as u128)
                         .expect("ArithmeticOverflow")
                 };
                 let payout_after_fee = post_tax - fee;
