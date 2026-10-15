@@ -8688,3 +8688,132 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
     assert!(id3 >= 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #31: Soft-deleted invoice state — payment entry points must reject
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "InvoiceDeleted")]
+fn test_31_pay_with_memo_on_deleted_invoice_panics() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 9_999);
+    c.delete_invoice(&creator, &id);
+
+    // pay_with_memo should now reject with InvoiceDeleted before any transfer.
+    c.pay_with_memo(&payer, &id, &500_i128, &0_u64, &false, &None);
+}
+
+#[test]
+#[should_panic(expected = "InvoiceDeleted")]
+fn test_31_pay_with_token_on_deleted_invoice_panics() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 9_999);
+    c.delete_invoice(&creator, &id);
+
+    // pay_with_token should now reject with InvoiceDeleted.
+    c.pay_with_token(&payer, &id, &token_id, &500_i128, &0_u64);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #32: Consistent grace period boundary — claim_refund at exact deadline
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_32_claim_refund_at_exact_deadline_succeeds() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+
+    // Deadline = 5_000; no grace period.
+    let deadline: u64 = 5_000;
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, deadline);
+
+    // Partial payment.
+    c.pay(&payer, &id, &500_i128, &0_u64, &false, &false, &None);
+
+    // At exactly the deadline, notify_expired marks it as Expired (uses >=).
+    env.ledger().set_timestamp(deadline);
+    c.notify_expired(&id);
+
+    // At exactly the deadline, claim_refund should also succeed (now uses >=).
+    c.claim_refund(&payer, &id);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #33: Duplicate invoice IDs in pool_pay must not bypass overfunding cap
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "payment exceeds remaining balance")]
+fn test_33_pool_pay_duplicate_invoice_id_overfund_reverts() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    // Invoice needs exactly 100 tokens.
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Two entries both targeting the same invoice with amount 80 each: total 160 > 100.
+    let mut payments = Vec::new(&env);
+    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 80 });
+    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 80 });
+
+    // Must revert because the accumulated pending exceeds the invoice total.
+    c.pool_pay(&payer, &payments);
+}
+
+#[test]
+fn test_33_pool_pay_duplicate_invoice_id_exact_fit_succeeds() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+
+    // Invoice needs exactly 100 tokens.
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    env.ledger().set_timestamp(1_000);
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+
+    // Two entries for the same invoice: 60 + 40 = 100, exactly meets the cap.
+    let mut payments = Vec::new(&env);
+    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 60 });
+    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 40 });
+
+    c.pool_pay(&payer, &payments);
+
+    // Invoice should be fully funded and auto-released.
+    assert_eq!(c.get_invoice(&id).funded, 100);
+    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+}

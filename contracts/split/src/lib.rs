@@ -3422,7 +3422,7 @@ impl SplitContract {
     pub fn set_dex_contract(env: Env, admin: Address, contract: Address) {
         require_admin_role(&env, &admin, AdminRole::Operator);
         env.storage()
-            .persistent()
+            .instance()
             .set(&soroban_sdk::symbol_short!("dex_ctr"), &contract);
     }
 
@@ -7680,6 +7680,11 @@ impl SplitContract {
 
         let mut invoice = load_invoice(&env, invoice_id);
 
+        // Reject payments targeting soft-deleted invoices (#31).
+        assert!(
+            invoice.status != InvoiceStatus::Deleted,
+            "InvoiceDeleted"
+        );
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
@@ -7723,7 +7728,7 @@ impl SplitContract {
             // Swap source_token -> invoice_token via DEX contract.
             let dex: Address = env
                 .storage()
-                .persistent()
+                .instance()
                 .get(&soroban_sdk::symbol_short!("dex_ctr"))
                 .expect("dex contract not set");
             let mut args: Vec<Val> = Vec::new(&env);
@@ -7835,7 +7840,7 @@ impl SplitContract {
 
         let dex: Address = env
             .storage()
-            .persistent()
+            .instance()
             .get(&soroban_sdk::symbol_short!("dex_ctr"))
             .expect("dex contract not set");
         let mut args: Vec<Val> = Vec::new(&env);
@@ -7933,6 +7938,9 @@ impl SplitContract {
         let shared_token = funding_token_for(&first_inv);
 
         // Validate all payments and compute total.
+        // Use an in-memory accumulator to detect duplicate invoice IDs within
+        // the same batch and prevent the overfunding bypass described in #33.
+        let mut pending_amounts: Map<u64, i128> = Map::new(&env);
         let mut total: i128 = 0;
         for p in payments.iter() {
             let inv = load_invoice(&env, p.invoice_id);
@@ -7947,10 +7955,14 @@ impl SplitContract {
             );
             assert!(p.amount > 0, "payment amount must be positive");
             let inv_total: i128 = inv.amounts.iter().sum();
+            // Accumulate pending amount for this invoice across all entries in
+            // the batch so duplicate IDs cannot each see the unfunded balance.
+            let already_pending: i128 = pending_amounts.get(p.invoice_id).unwrap_or(0);
             assert!(
-                inv.funded + p.amount <= inv_total,
+                inv.funded + already_pending + p.amount <= inv_total,
                 "payment exceeds remaining balance"
             );
+            pending_amounts.set(p.invoice_id, already_pending + p.amount);
             // All invoices must use the same token.
             assert!(
                 funding_token_for(&inv) == shared_token,
@@ -8548,7 +8560,7 @@ impl SplitContract {
             if let Some(dex_router) = env
                 .storage()
                 .instance()
-                .get::<_, Address>(&soroban_sdk::symbol_short!("dex_rtr"))
+                .get::<_, Address>(&soroban_sdk::symbol_short!("dex_ctr"))
             {
                 let token = invoice.tokens.get(0).expect("no token");
                 let path: Vec<Address> = env.invoke_contract(
@@ -9169,8 +9181,12 @@ impl SplitContract {
     ) {
         require_not_paused(&env);
         payer.require_auth();
-        // Validate memo corresponds to an existing invoice.
-        let _ = load_invoice(&env, memo);
+        // Validate memo corresponds to an existing, non-deleted invoice (#31).
+        let invoice = load_invoice(&env, memo);
+        assert!(
+            invoice.status != InvoiceStatus::Deleted,
+            "InvoiceDeleted"
+        );
         Self::_pay(
             &env,
             &payer,
@@ -11130,7 +11146,7 @@ impl SplitContract {
                 Some(grace_secs) => invoice.deadline.saturating_add(grace_secs),
                 None => invoice.deadline,
             };
-            assert!(env.ledger().timestamp() > refund_deadline, "InvalidStatus");
+            assert!(env.ledger().timestamp() >= refund_deadline, "InvalidStatus");
         }
         // Lazy expiry: a Pending invoice past its deadline is treated as
         // Expired without requiring a separate notify_expired() call first.
@@ -13841,6 +13857,11 @@ impl SplitContract {
         payer.require_auth();
 
         let invoice = load_invoice(&env, invoice_id);
+        // Reject payments targeting soft-deleted invoices (#31).
+        assert!(
+            invoice.status != InvoiceStatus::Deleted,
+            "InvoiceDeleted"
+        );
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
@@ -13949,7 +13970,7 @@ impl SplitContract {
             invoice.deadline
         };
         assert!(
-            env.ledger().timestamp() > refund_deadline,
+            env.ledger().timestamp() >= refund_deadline,
             "invoice has not expired yet"
         );
 
@@ -14104,6 +14125,11 @@ impl SplitContract {
         env.storage().persistent().remove(&key);
 
         let mut invoice = load_invoice(&env, invoice_id);
+        // Reject payments targeting soft-deleted invoices (#31).
+        assert!(
+            invoice.status != InvoiceStatus::Deleted,
+            "InvoiceDeleted"
+        );
         assert!(
             invoice.status == InvoiceStatus::Pending,
             "invoice is not pending"
