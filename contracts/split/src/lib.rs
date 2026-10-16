@@ -3063,7 +3063,9 @@ impl SplitContract {
     /// Withdraw a contribution before the invoice is fully funded.
     /// Only permitted while the invoice is in Pending status (Open/PartiallyFunded).
     /// The caller receives exactly the amount they contributed, the contribution
-    /// storage entry is deleted, and `invoice.funded` is decremented.
+    /// storage entry is deleted, `invoice.funded` is decremented, and the payer's
+    /// entries are pruned from all payment shards so that a subsequent `refund`
+    /// call cannot issue a second refund for the same contribution (double-refund fix).
     pub fn withdraw_contribution(env: Env, payer: Address, invoice_id: u64) -> Result<(), ContractError> {
         payer.require_auth();
 
@@ -3085,6 +3087,32 @@ impl SplitContract {
 
         // Delete the contribution record.
         env.storage().persistent().remove(&contrib_key);
+
+        // Prune the payer's Payment entries from all shards so that a later
+        // `refund` call does not re-refund amounts already returned here.
+        for shard_id in 0..SHARD_COUNT {
+            if let Some(shard_payments) = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+            {
+                let mut new_shard_payments: Vec<Payment> = Vec::new(&env);
+                for payment in shard_payments.iter() {
+                    if payment.payer != payer {
+                        new_shard_payments.push_back(payment.clone());
+                    }
+                }
+                if new_shard_payments.is_empty() {
+                    env.storage()
+                        .persistent()
+                        .remove(&pay_shard_key(invoice_id, shard_id));
+                } else {
+                    env.storage()
+                        .persistent()
+                        .set(&pay_shard_key(invoice_id, shard_id), &new_shard_payments);
+                }
+            }
+        }
 
         // Decrease funded amount.
         invoice.funded = invoice.funded.saturating_sub(amount);
@@ -3560,13 +3588,31 @@ impl SplitContract {
 
     /// Set an arbiter address for an invoice. Requires admin auth.
     /// Only the arbiter may raise and resolve disputes on this invoice.
+    /// Issue #12: Changing the arbiter is disallowed while a dispute is active to
+    /// prevent race conditions between the old and new arbiter's transactions.
     pub fn set_arbiter(env: Env, admin: Address, invoice_id: u64, arbiter: Address) {
         require_admin(&env);
         let _ = admin;
         let mut invoice = load_invoice(&env, invoice_id);
+        assert!(!invoice.disputed, "invoice is already disputed");
         invoice.arbiter = Some(arbiter.clone());
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("set_arb"), &arbiter);
+    }
+
+    /// Remove the arbiter from an invoice. Requires admin auth.
+    /// Issue #12: Provides a clean entry point to unset an arbiter on non-disputed invoices.
+    pub fn remove_arbiter(env: Env, admin: Address, invoice_id: u64) {
+        require_admin(&env);
+        let _ = admin;
+        let mut invoice = load_invoice(&env, invoice_id);
+        assert!(!invoice.disputed, "invoice is already disputed");
+        let removed = invoice.arbiter.clone();
+        invoice.arbiter = None;
+        save_invoice(&env, invoice_id, &invoice);
+        if let Some(ref addr) = removed {
+            append_audit_entry(&env, invoice_id, symbol_short!("rem_arb"), addr);
+        }
     }
 
     /// Add a co-creator to an invoice. Only the primary creator may call this.
@@ -5444,6 +5490,22 @@ impl SplitContract {
         if let Err(e) = assert_valid_bps(penalty_bps) {
             env.panic_with_error(e);
         }
+        // Issue #7: When `penalty_bps > 0` a meaningful `penalty_deadline` is
+        // required.  A deadline of 0 is indistinguishable from "unset" and,
+        // because every ledger timestamp is positive, would cause the late-
+        // penalty check in `_pay` to fire on the very first payment — even one
+        // made immediately after creation.  Reject the configuration before any
+        // storage is written.
+        if penalty_bps > 0 {
+            assert!(
+                penalty_deadline > 0,
+                "penalty_deadline must be set when penalty_bps > 0"
+            );
+            assert!(
+                penalty_deadline <= deadline,
+                "penalty_deadline must not exceed invoice deadline"
+            );
+        }
         assert!(min_funding_bps <= 10_000, "min_funding_bps must be ≤ 10000");
         // Issue #695: velocity_limit > 0 paired with velocity_window == 0 would cause
         // division-by-zero or undefined behaviour when computing per-payer spend rates.
@@ -5501,14 +5563,14 @@ impl SplitContract {
 
         let _total_amount: i128 = amounts.iter().sum();
 
-        // Issue #286: Verify no duplicate recipients
-        for i in 0..recipients.len() {
-            for j in (i + 1)..recipients.len() {
-                debug_assert!(
-                    recipients.get(i).unwrap() != recipients.get(j).unwrap(),
-                    "invariant: duplicate recipient addresses in list"
-                );
-            }
+        // Issue #286 / #9: Reject duplicate recipients in all build profiles,
+        // including release builds.  The previous `debug_assert!` loop was
+        // compiled out when `debug-assertions = false`, so duplicates slipped
+        // through in WASM deployments.  `validation::assert_unique_recipients`
+        // is an always-active O(n log n) guard that panics with
+        // `ContractError::DuplicateRecipient` when a duplicate is found.
+        if let Err(e) = validation::assert_unique_recipients(env, &recipients) {
+            env.panic_with_error(e);
         }
 
         if let Some(compliance_contract) = env
@@ -7349,7 +7411,42 @@ impl SplitContract {
             (credited_amount as u128 * invoice.insurance_premium_bps as u128 / 10_000u128) as i128;
         // Transfer the full amount from payer so excess can be refunded/donated.
         let excess = amount - credited_amount;
-        let total_charge = credited_amount + premium + excess;
+
+        // Issue #8: Pre-compute any late-payment penalty so it can be included
+        // in the single token transfer from payer to contract.  Pulling the
+        // penalty separately from the payer (as the old code did) caused a
+        // double-debit: `total_charge` already moved `amount` out of the
+        // payer's account, and then a second `transfer(payer, &recipient, …)`
+        // was attempted on top, which either reverted (if the payer had no
+        // surplus funds) or charged them twice.  By absorbing the penalty into
+        // `total_charge` here we make the contract the single source of funds
+        // for the subsequent per-recipient distributions.
+        let late_penalty_amount: i128 =
+            if invoice.penalty_deadline > 0
+                && env.ledger().timestamp() > invoice.penalty_deadline
+            {
+                let penalty_bps: u32 = if !invoice.penalty_tiers.is_empty() {
+                    let elapsed = env.ledger().timestamp() - invoice.penalty_deadline;
+                    let mut matched_bps = 0u32;
+                    for tier in invoice.penalty_tiers.iter() {
+                        if elapsed >= tier.seconds_after_deadline {
+                            matched_bps = tier.bps;
+                        }
+                    }
+                    matched_bps
+                } else {
+                    invoice.penalty_bps
+                };
+                if penalty_bps > 0 {
+                    (amount as u128 * penalty_bps as u128 / 10_000u128) as i128
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+        let total_charge = credited_amount + premium + excess + late_penalty_amount;
         token_client.transfer(payer, &env.current_contract_address(), &total_charge);
         // Issue #420: `ReturnSurplus` refunds the uncredited remainder immediately,
         // regardless of the legacy `overflow_behavior` setting.
@@ -7405,7 +7502,14 @@ impl SplitContract {
         invoice.insurance_fund += premium;
 
         // Penalty for late payment (issues #42, #211).
-        if env.ledger().timestamp() > invoice.penalty_deadline {
+        // Issue #7: Guard `penalty_deadline > 0` so that invoices created with
+        // `penalty_bps = 0` (or any invoice whose penalty_deadline is unset)
+        // never trigger the penalty path, regardless of the current timestamp.
+        // Issue #8: `late_penalty_amount` was already included in the single
+        // `total_charge` transfer from payer to contract above.  Distribute it
+        // from `env.current_contract_address()` to each recipient so the payer
+        // is only debited once for the full obligation.
+        if late_penalty_amount > 0 {
             let penalty_bps: u32 = if !invoice.penalty_tiers.is_empty() {
                 let elapsed = env.ledger().timestamp() - invoice.penalty_deadline;
                 let mut matched_bps = 0u32;
@@ -7418,35 +7522,32 @@ impl SplitContract {
             } else {
                 invoice.penalty_bps
             };
-            if penalty_bps > 0 {
-                let penalty_amount = (amount as u128 * penalty_bps as u128 / 10_000u128) as i128;
-                if penalty_amount > 0 {
-                    let total_amounts: i128 = invoice.amounts.iter().sum();
-                    let mut distributed: i128 = 0;
-                    let n = invoice.recipients.len();
-                    for i in 0..n {
-                        let recipient = invoice.recipients.get(i).unwrap();
-                        let amt = invoice.amounts.get(i).unwrap();
-                        let share = if i == n - 1 {
-                            penalty_amount - distributed
-                        } else {
-                            (penalty_amount as u128 * amt as u128 / total_amounts as u128) as i128
-                        };
-                        distributed += share;
-                        if share > 0 {
-                            token_client.transfer(payer, &recipient, &share);
-                        }
-                    }
-                    // Issue #687: surface the late-payment penalty deduction.
-                    events::penalty_applied(
-                        env,
-                        invoice_id,
-                        payer,
-                        penalty_amount,
-                        penalty_bps,
-                    );
+            let total_amounts: i128 = invoice.amounts.iter().sum();
+            let mut distributed: i128 = 0;
+            let n = invoice.recipients.len();
+            for i in 0..n {
+                let recipient = invoice.recipients.get(i).unwrap();
+                let amt = invoice.amounts.get(i).unwrap();
+                let share = if i == n - 1 {
+                    late_penalty_amount - distributed
+                } else {
+                    (late_penalty_amount as u128 * amt as u128 / total_amounts as u128) as i128
+                };
+                distributed += share;
+                if share > 0 {
+                    // Transfer from contract, not from payer — the penalty was
+                    // already collected as part of `total_charge` above.
+                    token_client.transfer(&env.current_contract_address(), &recipient, &share);
                 }
             }
+            // Issue #687: surface the late-payment penalty deduction.
+            events::penalty_applied(
+                env,
+                invoice_id,
+                payer,
+                late_penalty_amount,
+                penalty_bps,
+            );
         }
 
         // Write payment to sharded storage (issue #177).
@@ -9124,6 +9225,12 @@ impl SplitContract {
 
     /// Create a treasury group linking multiple invoice IDs to a single treasury address.
     /// Returns the new group id.
+    ///
+    /// Security: only the creator (or a co-creator) of every invoice in `invoice_ids`
+    /// may call this function. Each invoice must be in Pending status and must not
+    /// already belong to an existing treasury group. These checks prevent an
+    /// unauthorized caller from hijacking release funds by redirecting payouts to
+    /// an attacker-controlled treasury address.
     pub fn group_treasury_create(
         env: Env,
         creator: Address,
@@ -9132,6 +9239,33 @@ impl SplitContract {
     ) -> u64 {
         require_not_paused(&env);
         creator.require_auth();
+
+        // Validate every invoice before writing any state.
+        for iid in invoice_ids.iter() {
+            let invoice = load_invoice(&env, iid);
+
+            // Only the invoice creator or a co-creator may bind this invoice to a treasury group.
+            assert!(
+                invoice.creator == creator
+                    || invoice.co_creators.iter().any(|c| c == creator),
+                "not invoice creator or co-creator"
+            );
+
+            // Invoice must be pending — released/refunded invoices cannot be re-grouped.
+            assert!(
+                invoice.status == InvoiceStatus::Pending,
+                "invoice not pending"
+            );
+
+            // Reject invoices that already belong to a treasury group.
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&invoice_treasury_key(iid)),
+                "invoice already in treasury group"
+            );
+        }
+
         let id: u64 = env
             .storage()
             .persistent()
@@ -10492,6 +10626,8 @@ impl SplitContract {
                         success = true;
                     }
                 } else if invoice.smart_route {
+                    // Issue #14: Transfer via funding token exactly once.
+                    // The redundant secondary recipient_token_client.transfer has been removed.
                     let transfer_res = env.try_invoke_contract::<(), soroban_sdk::Error>(
                         &funding_token_client.address,
                         &symbol_short!("transfer"),
@@ -10500,18 +10636,6 @@ impl SplitContract {
                     if transfer_res.is_ok() {
                         success = true;
                     }
-                    let from_token = recipient_token_for(invoice, i as usize);
-                    let mut route_args: Vec<Val> = Vec::new(env);
-                    route_args.push_back(from_token.into_val(env));
-                    route_args.push_back(payout.into_val(env));
-                    route_args.push_back(recipient.clone().into_val(env));
-                    let recipient_token_client =
-                        token::Client::new(env, &recipient_token_for(invoice, i as usize));
-                    recipient_token_client.transfer(
-                        &env.current_contract_address(),
-                        &recipient,
-                        &payout,
-                    );
                 } else if invoice.convert_to_stream {
                     if let Some(stream_contract) = env
                         .storage()
@@ -10560,14 +10684,9 @@ impl SplitContract {
                             success = true;
                         }
                     } else {
+                        // Issue #14: execute_smart_route already transferred funds to
+                        // the recipient; do not execute a second transfer here.
                         success = true;
-                        let recipient_token_client =
-                            token::Client::new(env, &recipient_token_for(invoice, i as usize));
-                        recipient_token_client.transfer(
-                            &env.current_contract_address(),
-                            &recipient,
-                            &payout,
-                        );
                     }
                 }
 
@@ -10581,7 +10700,11 @@ impl SplitContract {
                 } else {
                     events::payout_initiated(env, invoice_id, i, &recipient, payout);
                 }
+            }
 
+            // Issue #13: Transfer total_tax to the tax authority exactly once,
+            // after the per-recipient loop completes, not on every iteration.
+            if total_tax > 0 {
                 if let Some(ref auth) = invoice.tax_authority {
                     funding_token_client.transfer(
                         &env.current_contract_address(),
@@ -12479,8 +12602,34 @@ impl SplitContract {
     /// `majority` — when `false` (default), all members must be fully funded before
     /// any can release (AllOrNothing). When `true`, a strict majority (>50%) being
     /// fully funded is sufficient to unblock release (Issue #212).
-    pub fn create_invoice_group(env: Env, invoice_ids: Vec<u64>, majority: bool) -> u64 {
+    ///
+    /// Security: `creator` must authenticate and must be the creator (or co-creator)
+    /// of every invoice being grouped. This prevents an unauthenticated attacker from
+    /// attaching arbitrary invoices to a group, which would permanently block
+    /// auto-release for those invoices (DoS).
+    pub fn create_invoice_group(env: Env, creator: Address, invoice_ids: Vec<u64>, majority: bool) -> u64 {
+        creator.require_auth();
         assert!(invoice_ids.len() >= 2, "group needs at least 2 invoices");
+
+        // Validate creator owns every invoice and that none are already grouped.
+        for id in invoice_ids.iter() {
+            let invoice = load_invoice(&env, id);
+
+            // Only the invoice creator or a co-creator may add the invoice to a group.
+            assert!(
+                invoice.creator == creator
+                    || invoice.co_creators.iter().any(|c| c == creator),
+                "not invoice creator or co-creator"
+            );
+
+            // Reject invoices already assigned to a group (prevents re-grouping).
+            assert!(
+                !env.storage()
+                    .persistent()
+                    .has(&invoice_group_key(id)),
+                "invoice already in a group"
+            );
+        }
 
         let grp_cnt_key = symbol_short!("grp_cnt");
         let group_id: u64 = env.storage().persistent().get(&grp_cnt_key).unwrap_or(0u64) + 1;
@@ -15352,6 +15501,13 @@ impl SplitContract {
             "InvoiceDeleted"
         );
         assert!(invoice.creator == caller, "OnlyCreator");
+        // Issue #11: If a creator cosigner is configured, require its authentication
+        // in addition to the creator's, mirroring the pattern used in cancel_invoice.
+        // This prevents a creator from bypassing the multi-party governance requirement
+        // by simply nominating a new creator that has no cosigner attached.
+        if let Some(cos) = invoice.creator_cosigner.clone() {
+            cos.require_auth();
+        }
         env.storage()
             .persistent()
             .set(&pending_creator_key(invoice_id), &successor);
