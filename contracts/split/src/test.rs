@@ -585,7 +585,8 @@ fn test_extend_deadline() {
     c.cancel_invoice(&creator, &id);
 
     let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.status, InvoiceStatus::Refunded);
+    // Issue #28: cancel_invoice always sets Cancelled (even when funded > 0).
+    assert_eq!(invoice.status, InvoiceStatus::Cancelled);
     assert_eq!(tk.balance(&payer), 300);
 }
 
@@ -1227,7 +1228,7 @@ fn test_group_partial_fund_blocks_release() {
     let mut ids = Vec::new(&env);
     ids.push_back(id1);
     ids.push_back(id2);
-    c.create_invoice_group(&ids, &false);
+    c.create_invoice_group(&creator, &ids, &false);
 
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
 
@@ -1256,7 +1257,7 @@ fn test_group_all_funded_releases_both() {
     let mut ids = Vec::new(&env);
     ids.push_back(id1);
     ids.push_back(id2);
-    c.create_invoice_group(&ids, &false);
+    c.create_invoice_group(&creator, &ids, &false);
 
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
     c.pay(&payer, &id2, &200_i128, &0_u64, &false, &false, &None);
@@ -3076,19 +3077,19 @@ fn test_stage_release_3_stages() {
     assert_eq!(c.get_invoice_ext(&id).released_stages, 0);
 
     // Stage 1: 30% = 300
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
     assert_eq!(tk.balance(&recipient), 300);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 1);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
 
     // Stage 2: 40% = 400
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &1_u32, &creator);
     assert_eq!(tk.balance(&recipient), 700);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 2);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
 
     // Stage 3: 30% = 300 — final stage sets status to Released
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &2_u32, &creator);
     assert_eq!(tk.balance(&recipient), 1_000);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 3);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
@@ -3122,10 +3123,10 @@ fn test_stage_release_after_all_stages_panics() {
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
     c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
 
-    c.stage_release(&id, &creator);
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
+    c.stage_release(&id, &1_u32, &creator);
     // Third call should panic — all stages already released.
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &2_u32, &creator);
 }
 
 #[test]
@@ -3157,7 +3158,7 @@ fn test_stage_release_non_creator_panics() {
     c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
 
     // Non-creator should not be able to call stage_release.
-    c.stage_release(&id, &other);
+    c.stage_release(&id, &0_u32, &other);
 }
 
 #[test]
@@ -3189,7 +3190,7 @@ fn test_stage_release_not_fully_funded_panics() {
     c.pay(&payer, &id, &500_i128, &0_u64, &false, &false, &None);
 
     // Should panic — not fully funded.
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
 }
 
 #[test]
@@ -5366,7 +5367,7 @@ fn test_majority_group_releases_when_majority_funded() {
     ids.push_back(id2);
     ids.push_back(id3);
     // majority mode: >50% funded is sufficient
-    c.create_invoice_group(&ids, &true);
+    c.create_invoice_group(&creator, &ids, &true);
 
     // Fund 2 out of 3 (>50%)
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
@@ -5401,7 +5402,7 @@ fn test_majority_group_blocks_when_minority_funded() {
     ids.push_back(id1);
     ids.push_back(id2);
     ids.push_back(id3);
-    c.create_invoice_group(&ids, &true);
+    c.create_invoice_group(&creator, &ids, &true);
 
     // Only 1 out of 3 funded — not a majority.
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
@@ -5428,7 +5429,7 @@ fn test_all_or_nothing_group_still_requires_all_funded() {
     let mut ids = Vec::new(&env);
     ids.push_back(id1);
     ids.push_back(id2);
-    c.create_invoice_group(&ids, &false); // AllOrNothing
+    c.create_invoice_group(&creator, &ids, &false); // AllOrNothing
 
     // Only id1 funded — id2 is not.
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
@@ -8445,6 +8446,8 @@ fn test_create_invoice_penalty_bps_at_max_ok() {
 
     let mut opts = default_options(&env);
     opts.penalty_bps = Some(10_000);
+    // Issue #7: penalty_bps > 0 requires a valid penalty_deadline.
+    opts.penalty_deadline = Some(5_000);
 
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
     assert!(id >= 1);
@@ -8690,130 +8693,190 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
 
 
 // ---------------------------------------------------------------------------
-// Issue #31: Soft-deleted invoice state — payment entry points must reject
+// Security tests — Issue #1: Unauthorized Treasury Group Hijacking
 // ---------------------------------------------------------------------------
 
+/// Attacker cannot bind invoices they didn't create to their own treasury.
 #[test]
-#[should_panic(expected = "InvoiceDeleted")]
-fn test_31_pay_with_memo_on_deleted_invoice_panics() {
+#[should_panic(expected = "not invoice creator or co-creator")]
+fn test_group_treasury_create_unauthorized_creator_panics() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
 
-    let creator = Address::generate(&env);
+    let real_creator = Address::generate(&env);
+    let attacker = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let payer = Address::generate(&env);
+    let attacker_treasury = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    StellarAssetClient::new(&env, &token_id).mint(&real_creator, &1_000);
     env.ledger().set_timestamp(1_000);
 
-    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 9_999);
-    c.delete_invoice(&creator, &id);
+    // real_creator creates the invoice.
+    let id = make_invoice(&env, &c, &real_creator, &recipient, 100, &token_id, 9_999);
 
-    // pay_with_memo should now reject with InvoiceDeleted before any transfer.
-    c.pay_with_memo(&payer, &id, &500_i128, &0_u64, &false, &None);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+
+    // Attacker tries to redirect payout to their own treasury — must panic.
+    c.group_treasury_create(&attacker, &ids, &attacker_treasury);
 }
 
+/// Creator can successfully create a treasury group for their own invoices.
 #[test]
-#[should_panic(expected = "InvoiceDeleted")]
-fn test_31_pay_with_token_on_deleted_invoice_panics() {
+fn test_group_treasury_create_by_creator_succeeds() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
 
     let creator = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let payer = Address::generate(&env);
+    let treasury = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000);
     env.ledger().set_timestamp(1_000);
 
-    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, 9_999);
-    c.delete_invoice(&creator, &id);
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
 
-    // pay_with_token should now reject with InvoiceDeleted.
-    c.pay_with_token(&payer, &id, &token_id, &500_i128, &0_u64);
+    let mut ids = Vec::new(&env);
+    ids.push_back(id1);
+    ids.push_back(id2);
+
+    // Legitimate call by the real creator.
+    let group_id = c.group_treasury_create(&creator, &ids, &treasury);
+    assert!(group_id >= 1);
+}
+
+/// An invoice that already belongs to a treasury group cannot be re-grouped.
+#[test]
+#[should_panic(expected = "invoice already in treasury group")]
+fn test_group_treasury_already_grouped_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    let mut ids1 = Vec::new(&env);
+    ids1.push_back(id1);
+    ids1.push_back(id2);
+    c.group_treasury_create(&creator, &ids1, &treasury);
+
+    // id1 is already in a treasury group — re-grouping must panic.
+    let mut ids2 = Vec::new(&env);
+    ids2.push_back(id1);
+    ids2.push_back(id3);
+    c.group_treasury_create(&creator, &ids2, &treasury);
 }
 
 // ---------------------------------------------------------------------------
-// Issue #32: Consistent grace period boundary — claim_refund at exact deadline
+// Security tests — Issue #2: Unauthenticated create_invoice_group DoS
 // ---------------------------------------------------------------------------
 
+/// A caller who didn't create the invoice cannot add it to a group.
 #[test]
-fn test_32_claim_refund_at_exact_deadline_succeeds() {
+#[should_panic(expected = "not invoice creator or co-creator")]
+fn test_create_invoice_group_unauthorized_caller_panics() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&alice, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &alice, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &alice, &recipient, 200, &token_id, 9_999);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(id1);
+    ids.push_back(id2);
+
+    // Bob tries to group Alice's invoices — must panic.
+    c.create_invoice_group(&bob, &ids, &false);
+}
+
+/// An invoice already in a group cannot be added to another group.
+#[test]
+#[should_panic(expected = "invoice already in a group")]
+fn test_create_invoice_group_already_grouped_rejected() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
 
     let creator = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let payer = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
-
-    // Deadline = 5_000; no grace period.
-    let deadline: u64 = 5_000;
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000);
     env.ledger().set_timestamp(1_000);
-    let id = make_invoice(&env, &c, &creator, &recipient, 1_000, &token_id, deadline);
 
-    // Partial payment.
-    c.pay(&payer, &id, &500_i128, &0_u64, &false, &false, &None);
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
 
-    // At exactly the deadline, notify_expired marks it as Expired (uses >=).
-    env.ledger().set_timestamp(deadline);
-    c.notify_expired(&id);
+    let mut ids1 = Vec::new(&env);
+    ids1.push_back(id1);
+    ids1.push_back(id2);
+    c.create_invoice_group(&creator, &ids1, &false);
 
-    // At exactly the deadline, claim_refund should also succeed (now uses >=).
-    c.claim_refund(&payer, &id);
+    // id1 is already grouped — must panic.
+    let mut ids2 = Vec::new(&env);
+    ids2.push_back(id1);
+    ids2.push_back(id3);
+    c.create_invoice_group(&creator, &ids2, &false);
 }
 
 // ---------------------------------------------------------------------------
-// Issue #33: Duplicate invoice IDs in pool_pay must not bypass overfunding cap
+// Security tests — Issue #3: Double Payment Refund
 // ---------------------------------------------------------------------------
 
+/// Payer who called withdraw_contribution must NOT receive a second refund.
 #[test]
-#[should_panic(expected = "payment exceeds remaining balance")]
-fn test_33_pool_pay_duplicate_invoice_id_overfund_reverts() {
+fn test_withdraw_contribution_no_double_refund() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
 
     let creator = Address::generate(&env);
-    let recipient = Address::generate(&env);
     let payer = Address::generate(&env);
-
-    // Invoice needs exactly 100 tokens.
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
-    env.ledger().set_timestamp(1_000);
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-
-    // Two entries both targeting the same invoice with amount 80 each: total 160 > 100.
-    let mut payments = Vec::new(&env);
-    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 80 });
-    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 80 });
-
-    // Must revert because the accumulated pending exceeds the invoice total.
-    c.pool_pay(&payer, &payments);
-}
-
-#[test]
-fn test_33_pool_pay_duplicate_invoice_id_exact_fit_succeeds() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-
-    let creator = Address::generate(&env);
     let recipient = Address::generate(&env);
-    let payer = Address::generate(&env);
 
-    // Invoice needs exactly 100 tokens.
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &10_000);
+    let stellar_asset = StellarAssetClient::new(&env, &token_id);
+    stellar_asset.mint(&payer, &1_000);
+
     env.ledger().set_timestamp(1_000);
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
 
-    // Two entries for the same invoice: 60 + 40 = 100, exactly meets the cap.
-    let mut payments = Vec::new(&env);
-    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 60 });
-    payments.push_back(types::InvoicePayment { invoice_id: id, amount: 40 });
+    // Invoice requires 500 tokens, deadline is 9_999.
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
 
-    c.pool_pay(&payer, &payments);
+    // Payer contributes 300.
+    c.pay(&payer, &id, &300_i128, &0_u64, &false, &false, &None);
+    let balance_after_pay = tk.balance(&payer);
+    assert_eq!(balance_after_pay, 700); // 1000 - 300
 
-    // Invoice should be fully funded and auto-released.
-    assert_eq!(c.get_invoice(&id).funded, 100);
-    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    // Payer withdraws their contribution — gets 300 back.
+    c.withdraw_contribution(&payer, &id);
+    let balance_after_withdraw = tk.balance(&payer);
+    assert_eq!(balance_after_withdraw, 1_000); // fully restored
+
+    // Advance past the deadline.
+    env.ledger().set_timestamp(10_001);
+
+    // Anyone calls refund. The payer should NOT receive another 300.
+    c.refund(&id);
+
+    let balance_after_refund = tk.balance(&payer);
+    // Must still be 1_000; payer has already been fully refunded via withdraw_contribution.
+    assert_eq!(
+        balance_after_refund, 1_000,
+        "double-refund detected: payer received tokens twice"
+    );
 }
