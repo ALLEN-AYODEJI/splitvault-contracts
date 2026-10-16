@@ -248,13 +248,27 @@ impl SplitFactory {
             .deploy(wasm_hash);
 
         // Invoke init on the deployed contract if init_args is non-empty.
+        //
+        // Safety / atomicity (#49): `env.invoke_contract` propagates any panic
+        // from the callee back to this call frame, causing the entire
+        // transaction to revert. Deployment-state mutations below are therefore
+        // only reachable when initialization succeeds, guaranteeing that no
+        // uninitialized contract is ever recorded in the deployment tracking.
+        //
+        // Callers MUST supply the exact argument list expected by the deployed
+        // contract's `initialize` function. A mismatched signature will cause
+        // the sub-call to panic and atomically roll back the deployment.
         if !init_args.is_empty() {
-            let _: Val = env.invoke_contract(
+            env.invoke_contract::<Val>(
                 &deployed_address,
                 &Symbol::new(&env, "initialize"),
                 init_args,
             );
         }
+
+        // Deployment state is only committed here — after initialization has
+        // completed successfully (#49). If the invoke_contract call above
+        // panicked, execution never reaches this point.
 
         // Record the deployed address.
         let mut updated_deployments = deployments;
