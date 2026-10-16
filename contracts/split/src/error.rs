@@ -145,8 +145,6 @@ pub enum ContractError {
     AlreadyPaid = 65,
     /// Recipient list is shorter than the configured minimum recipient count.
     TooFewRecipients = 66,
-    /// Issue #37: Oracle price timestamp is too old to be trusted.
-    StaleOraclePrice = 67,
-    /// Issue #38: Payment channel has passed its deadline and can be force-closed.
-    ChannelExpired = 68,
+    /// Issue #29: A stage release was attempted out of order; the preceding stage has not been released yet.
+    PriorStageNotReleased = 67,
 }

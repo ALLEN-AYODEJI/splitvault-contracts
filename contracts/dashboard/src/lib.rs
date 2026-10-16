@@ -64,6 +64,13 @@ impl DashboardContract {
             .checked_add(total)
             .expect("total_volume overflow");
         env.storage().persistent().set(&key, &dashboard);
+
+        // Emit event so external analytics pipelines can stream metric updates
+        // without polling contract storage (#50).
+        env.events().publish(
+            (symbol_short!("dash"), symbol_short!("created"), creator),
+            total,
+        );
     }
 
     pub fn record_released(env: Env, creator: Address, total: i128) {
@@ -95,6 +102,12 @@ impl DashboardContract {
             .checked_add(total)
             .expect("released_volume overflow");
         env.storage().persistent().set(&key, &dashboard);
+
+        // Emit event for real-time indexing of creator metrics (#50).
+        env.events().publish(
+            (symbol_short!("dash"), symbol_short!("released"), creator),
+            total,
+        );
     }
 
     pub fn record_refunded(env: Env, creator: Address) {
@@ -122,6 +135,12 @@ impl DashboardContract {
             .checked_add(1)
             .expect("refunded_count overflow");
         env.storage().persistent().set(&key, &dashboard);
+
+        // Emit event for real-time indexing of creator metrics (#50).
+        env.events().publish(
+            (symbol_short!("dash"), symbol_short!("refunded"), creator),
+            (),
+        );
     }
 
     pub fn get_creator_dashboard(env: Env, creator: Address) -> CreatorDashboard {
