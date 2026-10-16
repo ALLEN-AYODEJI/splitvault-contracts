@@ -57,6 +57,7 @@ mod events;
 pub mod types;
 mod validation;
 mod calc;
+mod math;
 mod stats;
 
 #[cfg(test)]
@@ -9889,20 +9890,66 @@ impl SplitContract {
         assert!(released_idx & bit == 0, "tranche already released");
 
         let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+
+        let platform_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&platform_fee_bps_key())
+            .unwrap_or(0u32);
+
+        let waivers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&platform_fee_waiver_list_key())
+            .unwrap_or_else(|| Vec::new(&env));
+
         let funded = invoice.funded;
         let n = invoice.recipients.len();
         let mut total_paid: i128 = 0;
+        let mut total_fee: i128 = 0;
+        let mut total_tax: i128 = 0;
         for i in 0..n {
             let recipient = invoice.recipients.get(i).unwrap();
             let amount = invoice.amounts.get(i).unwrap();
-            let payout = ((amount as u128)
+            let payout_raw = ((amount as u128)
                 .saturating_mul(tranche.basis_points as u128)
                 .saturating_mul(funded as u128)
                 / (10_000u128 * total as u128)) as i128;
-            if payout > 0 {
-                token_client.transfer(&env.current_contract_address(), &recipient, &payout);
-                total_paid += payout;
+            if payout_raw > 0 {
+                let is_waived = waivers.iter().any(|a| a == recipient);
+                let fee = if is_waived {
+                    0
+                } else {
+                    calc_platform_fee(payout_raw, platform_fee_bps).expect("ArithmeticOverflow")
+                };
+                let tax = (payout_raw as u128 * invoice.tax_bps as u128 / 10_000u128) as i128;
+                let payout = payout_raw - fee - tax;
+                total_fee += fee;
+                total_tax += tax;
+                if payout > 0 {
+                    token_client.transfer(&env.current_contract_address(), &recipient, &payout);
+                }
+                total_paid += payout_raw;
             }
+        }
+
+        if total_fee > 0 {
+            let treasury: Address = env
+                .storage()
+                .instance()
+                .get(&treasury_key())
+                .expect("treasury not set");
+            Self::distribute_fee(
+                &env,
+                total_fee,
+                &invoice.tokens.get(0).expect("no token"),
+                &treasury,
+            );
+        }
+
+        if total_tax > 0 {
+            let tax_authority = invoice.tax_authority.as_ref().unwrap();
+            token_client.transfer(&env.current_contract_address(), tax_authority, &total_tax);
         }
 
         released_idx |= bit;
@@ -10196,6 +10243,11 @@ impl SplitContract {
                 }
                 // Skip recipients whose full amount cannot be covered.
             }
+            // Only decrement funded by the amount actually transferred, not the
+            // full requested amount. Residual funds remain credited so they can
+            // be released or refunded in a subsequent call. (#16)
+            let actual_transferred = amount - remaining;
+            invoice.funded = invoice.funded.saturating_sub(actual_transferred);
         } else {
             // Original proportional distribution.
             let total_amounts: i128 = invoice.amounts.iter().sum();
@@ -10213,9 +10265,10 @@ impl SplitContract {
                     token_client.transfer(&env.current_contract_address(), &recipient, &share);
                 }
             }
+            // Proportional path always distributes the full requested amount.
+            invoice.funded = invoice.funded.saturating_sub(amount);
         }
 
-        invoice.funded -= amount;
         save_invoice(&env, invoice_id, &invoice);
         append_audit_entry(&env, invoice_id, symbol_short!("part_rel"), &creator);
         events::invoice_partially_released(&env, invoice_id, &invoice.recipients);
