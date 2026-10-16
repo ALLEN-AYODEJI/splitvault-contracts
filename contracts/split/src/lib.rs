@@ -4730,7 +4730,10 @@ impl SplitContract {
                 vec
             });
 
-        let mut fee: i128 = 0;
+        // Issue #24: accumulate unscaled numerators across all tiers and apply
+        // a single division at the end so that rounding error is at most 1
+        // unit regardless of how many brackets the amount spans.
+        let mut fee_numerator: u128 = 0;
         let mut remaining = amount;
         let mut prev_max: i128 = 0;
         for i in 0..brackets.len() {
@@ -4742,7 +4745,7 @@ impl SplitContract {
                 remaining
             };
             if slice > 0 {
-                fee += (slice as u128 * b.rate_bps as u128 / 10_000u128) as i128;
+                fee_numerator += slice as u128 * b.rate_bps as u128;
                 remaining -= slice;
             }
             prev_max = b.max_amount;
@@ -4750,7 +4753,7 @@ impl SplitContract {
                 break;
             }
         }
-        fee
+        (fee_numerator / 10_000u128) as i128
     }
 
     /// Issue #521: distribute `total_fee` across configured fee recipients.
@@ -7608,8 +7611,15 @@ impl SplitContract {
                     * (standard_fee_bps - invoice.early_bird_fee_bps) as u128
                     / 10_000u128) as i128;
                 if discount_amount > 0 {
-                    invoice.early_bird_fee_credit =
-                        invoice.early_bird_fee_credit.saturating_add(discount_amount);
+                    // Issue #23: cap total early-bird credit so it can never
+                    // exceed the platform fee computed on the post-payment
+                    // funded balance, preventing underflow at release.
+                    let funded_after = invoice.funded.saturating_add(credited_amount);
+                    let max_credit = Self::compute_fee(env.clone(), funded_after);
+                    invoice.early_bird_fee_credit = invoice
+                        .early_bird_fee_credit
+                        .saturating_add(discount_amount)
+                        .min(max_credit);
                     events::early_bird_payment(env, invoice_id, payer, discount_amount);
                 }
             }
@@ -9963,6 +9973,12 @@ impl SplitContract {
             .unwrap_or(0u32);
         let bit = 1u32 << tranche_index;
         assert!(released_idx & bit == 0, "tranche already released");
+
+        // Issue #25: guard against division-by-zero when funded or total is 0.
+        // `funded >= total` was already asserted above, so invoice.funded == 0
+        // implies total == 0 (all amounts zero), which is a degenerate invoice
+        // with nothing to distribute.
+        assert!(invoice.funded > 0, "NoFundsToRelease");
 
         let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
 
@@ -14207,8 +14223,12 @@ impl SplitContract {
 
         let mut invoice = load_invoice(&env, invoice_id);
 
-        // Must still be pending (not fully released/refunded via bulk refund).
-        if invoice.status != InvoiceStatus::Pending {
+        // Must still be pending or expired (not fully released/refunded via
+        // bulk refund). Issue #26: allowing Expired permits individual payers
+        // to reclaim their deposits after notify_expired() has been called,
+        // which transitions the invoice from Pending to Expired. Without this,
+        // funds would be permanently locked once a keeper calls notify_expired.
+        if invoice.status != InvoiceStatus::Pending && invoice.status != InvoiceStatus::Expired {
             // Idempotent: already refunded via bulk path — nothing to do.
             return;
         }
