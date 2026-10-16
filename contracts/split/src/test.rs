@@ -585,7 +585,8 @@ fn test_extend_deadline() {
     c.cancel_invoice(&creator, &id);
 
     let invoice = c.get_invoice(&id);
-    assert_eq!(invoice.status, InvoiceStatus::Refunded);
+    // Issue #28: cancel_invoice always sets Cancelled (even when funded > 0).
+    assert_eq!(invoice.status, InvoiceStatus::Cancelled);
     assert_eq!(tk.balance(&payer), 300);
 }
 
@@ -3076,19 +3077,19 @@ fn test_stage_release_3_stages() {
     assert_eq!(c.get_invoice_ext(&id).released_stages, 0);
 
     // Stage 1: 30% = 300
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
     assert_eq!(tk.balance(&recipient), 300);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 1);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
 
     // Stage 2: 40% = 400
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &1_u32, &creator);
     assert_eq!(tk.balance(&recipient), 700);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 2);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Pending);
 
     // Stage 3: 30% = 300 — final stage sets status to Released
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &2_u32, &creator);
     assert_eq!(tk.balance(&recipient), 1_000);
     assert_eq!(c.get_invoice_ext(&id).released_stages, 3);
     assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
@@ -3122,10 +3123,10 @@ fn test_stage_release_after_all_stages_panics() {
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
     c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
 
-    c.stage_release(&id, &creator);
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
+    c.stage_release(&id, &1_u32, &creator);
     // Third call should panic — all stages already released.
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &2_u32, &creator);
 }
 
 #[test]
@@ -3157,7 +3158,7 @@ fn test_stage_release_non_creator_panics() {
     c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
 
     // Non-creator should not be able to call stage_release.
-    c.stage_release(&id, &other);
+    c.stage_release(&id, &0_u32, &other);
 }
 
 #[test]
@@ -3189,7 +3190,7 @@ fn test_stage_release_not_fully_funded_panics() {
     c.pay(&payer, &id, &500_i128, &0_u64, &false, &false, &None);
 
     // Should panic — not fully funded.
-    c.stage_release(&id, &creator);
+    c.stage_release(&id, &0_u32, &creator);
 }
 
 #[test]
