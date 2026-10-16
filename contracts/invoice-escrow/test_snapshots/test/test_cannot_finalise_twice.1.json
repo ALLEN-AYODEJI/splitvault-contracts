@@ -115,6 +115,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "ban_ledger"
+                    },
+                    "val": {
+                      "u32": 0
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "banned_at"
                     },
                     "val": {
