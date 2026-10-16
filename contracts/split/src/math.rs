@@ -71,6 +71,13 @@ pub fn normalize_amount(raw: i128, decimals: u32) -> Result<i128, ContractError>
         let result = (raw as u128)
             .checked_div(factor)
             .ok_or(ContractError::ArithmeticOverflow)?;
+        // Issue #55: a non-zero raw amount that downscales to exactly 0 means
+        // the value is smaller than the smallest representable canonical unit.
+        // Silently returning 0 would cause fund-distribution skew; reject it
+        // so callers can handle precision loss explicitly.
+        if raw > 0 && result == 0 {
+            return Err(ContractError::ArithmeticOverflow);
+        }
         Ok(result as i128)
     }
 }
@@ -276,6 +283,28 @@ mod tests {
             1_000_000_000_000_000_000
         );
         assert_eq!(denormalize_amount(0, 18).unwrap(), 0);
+    }
+
+    /// Issue #55: a non-zero raw value smaller than the downscale factor must
+    /// return Err rather than silently producing 0.
+    ///
+    /// Example: normalizing 1 raw unit of an 18-decimal token (factor = 10^11)
+    /// would produce 0 via integer division, hiding the value entirely.
+    #[test]
+    fn normalize_nonzero_downscale_to_zero_returns_error() {
+        // 18-decimal token: factor = 10^11; any raw value < 10^11 downscales to 0.
+        assert_eq!(
+            normalize_amount(1, 18),
+            Err(ContractError::ArithmeticOverflow)
+        );
+        assert_eq!(
+            normalize_amount(99_999_999_999, 18), // 10^11 - 1
+            Err(ContractError::ArithmeticOverflow)
+        );
+        // Exactly at the boundary (= factor) must succeed and produce 1.
+        assert_eq!(normalize_amount(100_000_000_000, 18).unwrap(), 1);
+        // Zero is always fine.
+        assert_eq!(normalize_amount(0, 18).unwrap(), 0);
     }
 
     /// raw < 0: normalize returns Err(ArithmeticOverflow) regardless of decimals.
