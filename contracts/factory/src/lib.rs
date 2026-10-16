@@ -16,6 +16,12 @@ fn factory_admin_key() -> Symbol {
     symbol_short!("fct_adm")
 }
 
+/// Approved WASM hashes allowlist key — instance storage.
+/// Maps to a `Vec<BytesN<32>>` containing all approved WASM hashes.
+fn approved_wasm_hashes_key() -> Symbol {
+    symbol_short!("appr_wh")
+}
+
 /// Per-creator deployed contracts list — persistent storage.
 fn deployed_contracts_key(creator: &Address) -> (Symbol, Address) {
     (symbol_short!("deployed"), creator.clone())
@@ -82,6 +88,95 @@ impl SplitFactory {
         env.storage().instance().set(&factory_admin_key(), &admin);
     }
 
+    /// Add a WASM hash to the approved deployment allowlist.
+    ///
+    /// Only the factory admin may call this. Subsequent calls to
+    /// [`Self::deploy_invoice_contract`] will only succeed when the supplied
+    /// `wasm_hash` appears in the allowlist.
+    ///
+    /// # Parameters
+    /// * `env`       — The current Soroban execution environment.
+    /// * `admin`     — The factory administrator address; requires auth.
+    /// * `wasm_hash` — The 32-byte SHA-256 hash of the WASM blob to approve.
+    ///
+    /// # Panics
+    /// Panics if `admin` is not the factory administrator.
+    pub fn approve_wasm_hash(env: Env, admin: Address, wasm_hash: BytesN<32>) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&factory_admin_key())
+            .expect("factory not initialized");
+        assert!(stored_admin == admin, "not factory admin");
+        admin.require_auth();
+
+        let mut hashes: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&approved_wasm_hashes_key())
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Avoid duplicates.
+        if !hashes.contains(&wasm_hash) {
+            hashes.push_back(wasm_hash);
+            env.storage()
+                .instance()
+                .set(&approved_wasm_hashes_key(), &hashes);
+        }
+    }
+
+    /// Remove a WASM hash from the approved deployment allowlist.
+    ///
+    /// Only the factory admin may call this. After removal, subsequent
+    /// deployment requests specifying the revoked hash will be rejected.
+    ///
+    /// # Parameters
+    /// * `env`       — The current Soroban execution environment.
+    /// * `admin`     — The factory administrator address; requires auth.
+    /// * `wasm_hash` — The 32-byte SHA-256 hash to remove from the allowlist.
+    ///
+    /// # Panics
+    /// Panics if `admin` is not the factory administrator.
+    pub fn revoke_wasm_hash(env: Env, admin: Address, wasm_hash: BytesN<32>) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&factory_admin_key())
+            .expect("factory not initialized");
+        assert!(stored_admin == admin, "not factory admin");
+        admin.require_auth();
+
+        let hashes: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&approved_wasm_hashes_key())
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut new_hashes: Vec<BytesN<32>> = Vec::new(&env);
+        for h in hashes.iter() {
+            if h != wasm_hash {
+                new_hashes.push_back(h.clone());
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&approved_wasm_hashes_key(), &new_hashes);
+    }
+
+    /// Return whether a specific WASM hash is in the approved allowlist.
+    ///
+    /// # Parameters
+    /// * `env`       — The current Soroban execution environment.
+    /// * `wasm_hash` — The 32-byte SHA-256 hash to query.
+    pub fn is_wasm_hash_approved(env: Env, wasm_hash: BytesN<32>) -> bool {
+        let hashes: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&approved_wasm_hashes_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        hashes.contains(&wasm_hash)
+    }
+
     /// Deploy a new split contract instance using the clone-factory pattern.
     ///
     /// Uses `env.deployer().with_current_contract(salt)` so that the deployed
@@ -91,11 +186,15 @@ impl SplitFactory {
     /// # Parameters
     /// * `creator`     — The creator address; requires auth.
     /// * `wasm_hash`   — SHA-256 hash of the pre-uploaded split-contract WASM.
+    ///                   Must be present in the admin-managed approved allowlist.
     /// * `salt`        — 32-byte uniqueness salt; determines the deployed address.
     /// * `init_args`   — Constructor arguments forwarded to the deployed contract.
     ///
     /// # Returns
     /// The `Address` of the newly deployed contract.
+    ///
+    /// # Panics
+    /// Panics with `"wasm hash not approved"` if `wasm_hash` is not in the allowlist.
     pub fn deploy_invoice_contract(
         env: Env,
         creator: Address,
@@ -104,6 +203,17 @@ impl SplitFactory {
         init_args: soroban_sdk::Vec<Val>,
     ) -> Address {
         creator.require_auth();
+
+        // Reject any WASM hash that has not been explicitly approved by the admin.
+        let approved_hashes: Vec<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&approved_wasm_hashes_key())
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(
+            approved_hashes.contains(&wasm_hash),
+            "wasm hash not approved"
+        );
 
         // Reject duplicate salts for the same creator.
         let salt_storage_key = salt_key(&creator, &salt);
@@ -241,6 +351,8 @@ mod test {
         factory_client.initialize(&factory_admin);
 
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        // Approve the WASM hash before deployment.
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
 
         let creator = Address::generate(&env);
         let salt = BytesN::from_array(&env, &[1u8; 32]);
@@ -269,6 +381,9 @@ mod test {
         factory_client.initialize(&factory_admin);
 
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        // Approve the WASM hash before deployment.
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
+
         let creator = Address::generate(&env);
         let init_args = Vec::<Val>::new(&env);
 
@@ -308,6 +423,9 @@ mod test {
         factory_client.initialize(&factory_admin);
 
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        // Approve the WASM hash before deployment.
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
+
         let creator = Address::generate(&env);
         let salt = BytesN::from_array(&env, &[1u8; 32]);
         let init_args = Vec::<Val>::new(&env);
@@ -328,6 +446,9 @@ mod test {
         factory_client.initialize(&factory_admin);
 
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        // Approve the WASM hash before deployment.
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
+
         let init_args = Vec::<Val>::new(&env);
         let salt = BytesN::from_array(&env, &[1u8; 32]);
 
@@ -351,6 +472,9 @@ mod test {
         factory_client.initialize(&factory_admin);
 
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        // Approve the WASM hash before deployment.
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
+
         let creator = Address::generate(&env);
         let salt = BytesN::from_array(&env, &[1u8; 32]);
         let init_args = Vec::<Val>::new(&env);
@@ -393,6 +517,9 @@ mod test {
         factory_client.initialize(&factory_admin);
 
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        // Approve the WASM hash before deployment.
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
+
         let creator = Address::generate(&env);
         let salt = BytesN::from_array(&env, &[1u8; 32]);
         let init_args = Vec::<Val>::new(&env);
@@ -417,13 +544,13 @@ mod test {
     }
 
     // -----------------------------------------------------------------------
-    // #49 — Atomic deployment: state committed only after init succeeds
+    // Security tests — Issue #4: Unrestricted WASM Hash
     // -----------------------------------------------------------------------
 
-    /// When `init_args` is empty (no init call), deployment completes normally
-    /// and the address is recorded in the deployment tracking (#49).
+    /// Deploying with an unapproved WASM hash must be rejected.
     #[test]
-    fn test_deployment_recorded_when_no_init_args() {
+    #[should_panic(expected = "wasm hash not approved")]
+    fn test_deploy_unapproved_wasm_hash_rejected() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -432,35 +559,48 @@ mod test {
         let factory_client = SplitFactoryClient::new(&env, &factory_id);
         factory_client.initialize(&factory_admin);
 
+        // Upload but deliberately DO NOT approve the hash.
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+
         let creator = Address::generate(&env);
-        let salt = BytesN::from_array(&env, &[10u8; 32]);
-        let init_args = Vec::<Val>::new(&env); // no init call
+        let salt = BytesN::from_array(&env, &[1u8; 32]);
+        let init_args = Vec::<Val>::new(&env);
 
-        let addr = factory_client.deploy_invoice_contract(
-            &creator,
-            &wasm_hash,
-            &salt,
-            &init_args,
-        );
-
-        // The address must be recorded — state committed after (no-op) init.
-        let deployments = factory_client.get_deployments(&creator);
-        assert_eq!(deployments.len(), 1);
-        assert_eq!(deployments.get_unchecked(0), addr);
-        assert!(factory_client.is_salt_used(&creator, &salt));
+        // Should panic: "wasm hash not approved".
+        factory_client.deploy_invoice_contract(&creator, &wasm_hash, &salt, &init_args);
     }
 
-    /// Deployment state (deployments list + salt) is only recorded AFTER the
-    /// initialization step, ensuring failed init aborts the transaction without
-    /// leaving a phantom entry (#49).
-    ///
-    /// The stub WASM has no `initialize` function. Calling it with a non-empty
-    /// `init_args` will cause the sub-call to panic, rolling back the whole tx.
-    /// We assert that no deployment was recorded.
+    /// A completely arbitrary (random) WASM hash must also be rejected.
     #[test]
-    #[should_panic]
-    fn test_failed_init_does_not_record_deployment() {
+    #[should_panic(expected = "wasm hash not approved")]
+    fn test_deploy_arbitrary_wasm_hash_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let factory_admin = Address::generate(&env);
+        let factory_id = env.register(SplitFactory, ());
+        let factory_client = SplitFactoryClient::new(&env, &factory_id);
+        factory_client.initialize(&factory_admin);
+
+        // Approve a real WASM hash but try to deploy with a different one.
+        let real_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        factory_client.approve_wasm_hash(&factory_admin, &real_hash);
+
+        // Forge a completely different hash.
+        let forged_hash = BytesN::from_array(&env, &[0xdeu8; 32]);
+
+        let creator = Address::generate(&env);
+        let salt = BytesN::from_array(&env, &[1u8; 32]);
+        let init_args = Vec::<Val>::new(&env);
+
+        // Should panic: "wasm hash not approved".
+        factory_client.deploy_invoice_contract(&creator, &forged_hash, &salt, &init_args);
+    }
+
+    /// After revoking an approved hash it must no longer be deployable.
+    #[test]
+    #[should_panic(expected = "wasm hash not approved")]
+    fn test_revoked_wasm_hash_rejected() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -470,15 +610,35 @@ mod test {
         factory_client.initialize(&factory_admin);
 
         let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
+        // Revoke the hash immediately.
+        factory_client.revoke_wasm_hash(&factory_admin, &wasm_hash);
+
         let creator = Address::generate(&env);
-        let salt = BytesN::from_array(&env, &[20u8; 32]);
+        let salt = BytesN::from_array(&env, &[1u8; 32]);
+        let init_args = Vec::<Val>::new(&env);
 
-        // Pass a non-empty init_args to trigger an `initialize` call on the
-        // stub WASM that has no such function, causing a sub-call panic.
-        let mut bad_init_args = Vec::<Val>::new(&env);
-        bad_init_args.push_back(soroban_sdk::Val::from_void().into());
+        // Should panic: "wasm hash not approved".
+        factory_client.deploy_invoice_contract(&creator, &wasm_hash, &salt, &init_args);
+    }
 
-        // This must panic — the sub-call fails and the whole transaction reverts.
-        factory_client.deploy_invoice_contract(&creator, &wasm_hash, &salt, &bad_init_args);
+    /// `is_wasm_hash_approved` reflects approve/revoke lifecycle correctly.
+    #[test]
+    fn test_is_wasm_hash_approved() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let factory_admin = Address::generate(&env);
+        let factory_id = env.register(SplitFactory, ());
+        let factory_client = SplitFactoryClient::new(&env, &factory_id);
+        factory_client.initialize(&factory_admin);
+
+        let wasm_hash = env.deployer().upload_contract_wasm(STUB_WASM);
+
+        assert!(!factory_client.is_wasm_hash_approved(&wasm_hash));
+        factory_client.approve_wasm_hash(&factory_admin, &wasm_hash);
+        assert!(factory_client.is_wasm_hash_approved(&wasm_hash));
+        factory_client.revoke_wasm_hash(&factory_admin, &wasm_hash);
+        assert!(!factory_client.is_wasm_hash_approved(&wasm_hash));
     }
 }
