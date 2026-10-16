@@ -290,6 +290,19 @@ fn storage_key_snapshot() {
     keys.push(("cosigner_thresh_key", hex_xdr(&env, cosigner_thresh_key(1))));
     keys.push(("cosign_key", hex_xdr(&env, cosign_key(1))));
 
+    // Issue #39: memo deduplication key — CompoundKey::MemoDedupe(BytesN<32>)
+    {
+        use storage_keys::CompoundKey;
+        let dummy: soroban_sdk::BytesN<32> = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        keys.push(("memo_dedupe_key", hex_xdr(&env, CompoundKey::MemoDedupe(dummy))));
+    }
+
+    // Issue #41: per-payer tip accumulator key — CompoundKey::TipTotal(u64, Address)
+    {
+        use storage_keys::CompoundKey;
+        keys.push(("tip_total_key", hex_xdr(&env, CompoundKey::TipTotal(1, a.clone()))));
+    }
+
     // Sort by key name for deterministic output
     keys.sort_by(|a, b| a.0.cmp(b.0));
 
