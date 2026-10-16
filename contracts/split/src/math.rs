@@ -43,31 +43,46 @@ use crate::error::ContractError;
 /// All split arithmetic is performed in this scale.
 pub const CANONICAL_DECIMALS: u32 = 7;
 
+/// Maximum decimal count supported by normalize_amount / denormalize_amount.
+///
+/// 10u128.pow(38) ≈ 1e38, which is within u128::MAX (~3.4e38), while
+/// 10u128.pow(39) overflows. Capping at 38 keeps the factor computation safe
+/// regardless of the raw input amount. (#18)
+pub const MAX_SUPPORTED_DECIMALS: u32 = 38;
+
 /// Scale a raw token amount to the canonical 7-decimal internal representation.
 ///
 /// * `raw`     — the amount in the token's native (smallest) unit.
 /// * `decimals` — the token's declared decimal count (e.g. 7 for XLM, 6 for USDC).
 ///
 /// Returns the amount expressed in 7-decimal canonical units, or
-/// `Err(ContractError::ArithmeticOverflow)` when the scaling multiplication
+/// `Err(ContractError::InvalidAmount)` when `decimals` exceeds [`MAX_SUPPORTED_DECIMALS`],
+/// or `Err(ContractError::ArithmeticOverflow)` when the scaling multiplication
 /// or division would overflow `i128` bounds.
 pub fn normalize_amount(raw: i128, decimals: u32) -> Result<i128, ContractError> {
     if raw < 0 {
         return Err(ContractError::ArithmeticOverflow);
+    }
+    if decimals > MAX_SUPPORTED_DECIMALS {
+        return Err(ContractError::InvalidAmount);
     }
     if decimals == CANONICAL_DECIMALS {
         return Ok(raw);
     }
     if decimals < CANONICAL_DECIMALS {
         let shift = CANONICAL_DECIMALS - decimals;
-        let factor = 10u128.pow(shift);
+        let factor = 10u128
+            .checked_pow(shift)
+            .ok_or(ContractError::ArithmeticOverflow)?;
         let result = (raw as u128)
             .checked_mul(factor)
             .ok_or(ContractError::ArithmeticOverflow)?;
         Ok(result as i128)
     } else {
         let shift = decimals - CANONICAL_DECIMALS;
-        let factor = 10u128.pow(shift);
+        let factor = 10u128
+            .checked_pow(shift)
+            .ok_or(ContractError::ArithmeticOverflow)?;
         let result = (raw as u128)
             .checked_div(factor)
             .ok_or(ContractError::ArithmeticOverflow)?;
@@ -81,25 +96,33 @@ pub fn normalize_amount(raw: i128, decimals: u32) -> Result<i128, ContractError>
 /// * `decimals`   — the token's declared decimal count.
 ///
 /// Returns the amount in the token's native (smallest) unit, or
-/// `Err(ContractError::ArithmeticOverflow)` when the scaling multiplication
+/// `Err(ContractError::InvalidAmount)` when `decimals` exceeds [`MAX_SUPPORTED_DECIMALS`],
+/// or `Err(ContractError::ArithmeticOverflow)` when the scaling multiplication
 /// or division would overflow `i128` bounds.
 pub fn denormalize_amount(normalized: i128, decimals: u32) -> Result<i128, ContractError> {
     if normalized < 0 {
         return Err(ContractError::ArithmeticOverflow);
+    }
+    if decimals > MAX_SUPPORTED_DECIMALS {
+        return Err(ContractError::InvalidAmount);
     }
     if decimals == CANONICAL_DECIMALS {
         return Ok(normalized);
     }
     if decimals < CANONICAL_DECIMALS {
         let shift = CANONICAL_DECIMALS - decimals;
-        let factor = 10u128.pow(shift);
+        let factor = 10u128
+            .checked_pow(shift)
+            .ok_or(ContractError::ArithmeticOverflow)?;
         let result = (normalized as u128)
             .checked_div(factor)
             .ok_or(ContractError::ArithmeticOverflow)?;
         Ok(result as i128)
     } else {
         let shift = decimals - CANONICAL_DECIMALS;
-        let factor = 10u128.pow(shift);
+        let factor = 10u128
+            .checked_pow(shift)
+            .ok_or(ContractError::ArithmeticOverflow)?;
         let result = (normalized as u128)
             .checked_mul(factor)
             .ok_or(ContractError::ArithmeticOverflow)?;
@@ -125,8 +148,8 @@ mod tests {
 
     #[test]
     fn normalize_2_decimal_upscales() {
-        // 2-decimal token: 100 raw -> 1_000_000 canonical
-        assert_eq!(normalize_amount(100, 2).unwrap(), 1_000_000);
+        // 2-decimal token: 100 raw (1.00 token) → multiply by 10^5 → 10_000_000 canonical
+        assert_eq!(normalize_amount(100, 2).unwrap(), 10_000_000);
     }
 
     #[test]
@@ -317,5 +340,46 @@ mod tests {
         // denormalize _divides_ by 10^7, which never overflows. Verify it succeeds instead.
         // (The overflow case for denormalize/0 is not possible by construction.)
         assert!(denormalize_amount(i128::MAX, 0).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #18: excessive decimals rejection tests
+    // -----------------------------------------------------------------------
+
+    /// normalize_amount with decimals = 50 must return Err(InvalidAmount). (#18)
+    #[test]
+    fn test_normalize_amount_excessive_decimals_returns_err() {
+        // 50 > MAX_SUPPORTED_DECIMALS (38): 10u128.pow(43) would overflow u128.
+        assert_eq!(
+            normalize_amount(1_000, 50),
+            Err(ContractError::InvalidAmount)
+        );
+    }
+
+    /// denormalize_amount with decimals = 50 must return Err(InvalidAmount). (#18)
+    #[test]
+    fn test_denormalize_amount_excessive_decimals_returns_err() {
+        assert_eq!(
+            denormalize_amount(1_000, 50),
+            Err(ContractError::InvalidAmount)
+        );
+    }
+
+    /// The boundary: decimals == MAX_SUPPORTED_DECIMALS (38) must succeed without panic. (#18)
+    #[test]
+    fn test_normalize_amount_at_max_supported_decimals_ok() {
+        // decimals = 38 > 7, so we divide by 10^31. A raw value of 10^31 normalises to 1.
+        let raw: i128 = 10_000_000_000_000_000_000_000_000_000_000i128; // 10^31
+        let result = normalize_amount(raw, MAX_SUPPORTED_DECIMALS);
+        assert_eq!(result, Ok(1));
+    }
+
+    /// decimals == MAX_SUPPORTED_DECIMALS + 1 = 39 is rejected. (#18)
+    #[test]
+    fn test_normalize_amount_one_above_max_returns_err() {
+        assert_eq!(
+            normalize_amount(1, MAX_SUPPORTED_DECIMALS + 1),
+            Err(ContractError::InvalidAmount)
+        );
     }
 }

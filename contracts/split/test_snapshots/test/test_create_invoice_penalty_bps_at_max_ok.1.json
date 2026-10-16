@@ -414,7 +414,9 @@
                       "key": {
                         "symbol": "penalty_deadline"
                       },
-                      "val": "void"
+                      "val": {
+                        "u64": "5000"
+                      }
                     },
                     {
                       "key": {
@@ -1670,7 +1672,7 @@
                       "symbol": "penalty_deadline"
                     },
                     "val": {
-                      "u64": "0"
+                      "u64": "5000"
                     }
                   },
                   {
