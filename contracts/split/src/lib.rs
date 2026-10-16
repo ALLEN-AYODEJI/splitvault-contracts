@@ -6862,6 +6862,138 @@ impl SplitContract {
             .remove(&channel_key(invoice_id, &payer));
     }
 
+    /// Issue #38: Force-close a payment channel on behalf of a payer who has
+    /// become unresponsive.
+    ///
+    /// When a payer loses access to their private key or refuses to cooperate,
+    /// funds deposited into the channel would otherwise remain locked forever.
+    /// This entry point lets the **invoice creator** settle the channel after
+    /// the invoice deadline has passed, crediting the net-paid portion toward
+    /// the invoice and returning the unspent balance to the payer.
+    ///
+    /// # Access control
+    /// Requires auth from `closer`, who must be the invoice creator.
+    ///
+    /// # Deadline requirement
+    /// The invoice deadline must have elapsed before force-close is permitted,
+    /// giving the payer ample time to close the channel themselves first.
+    pub fn force_close_channel(
+        env: Env,
+        closer: Address,
+        payer: Address,
+        invoice_id: u64,
+    ) {
+        require_not_paused(&env);
+        closer.require_auth();
+
+        let invoice = load_invoice(&env, invoice_id);
+
+        // Only the invoice creator may force-close a channel.
+        assert!(
+            closer == invoice.creator,
+            "{}",
+            ContractError::NotAuthorized as u32
+        );
+
+        // Issue #38: force-close is only available after the invoice deadline,
+        // ensuring the payer always has the opportunity to close voluntarily first.
+        assert!(
+            env.ledger().timestamp() > invoice.deadline,
+            "{}",
+            ContractError::ChannelExpired as u32
+        );
+
+        let state: (i128, i128) = env
+            .storage()
+            .persistent()
+            .get(&channel_key(invoice_id, &payer))
+            .expect("channel not found");
+        let balance = state.0;
+        let deposited = state.1;
+        let net_paid = deposited - balance;
+
+        let mut invoice = load_invoice(&env, invoice_id);
+
+        if net_paid > 0 && invoice.status == InvoiceStatus::Pending && !invoice.disputed {
+            // Write the net-paid amount into sharded payment storage.
+            let shard_id = compute_shard_id(&env, &payer);
+            let mut shard_payments: Vec<Payment> = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
+                .unwrap_or_else(|| Vec::new(&env));
+            shard_payments.push_back(Payment {
+                payer: payer.clone(),
+                amount: net_paid,
+                tip: 0,
+                attestation_hash: None,
+                donate_on_failure: false,
+                ledger: env.ledger().sequence(),
+                timestamp: env.ledger().timestamp(),
+            });
+            env.storage()
+                .persistent()
+                .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+
+            invoice.funded += net_paid;
+            let cumulative_key = cumulative_contributed_key(invoice_id);
+            let cumulative: i128 = env.storage().persistent().get(&cumulative_key).unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&cumulative_key, &(cumulative + net_paid));
+
+            events::payment_received(
+                &env,
+                invoice_id,
+                &payer,
+                net_paid,
+                &funding_token_for(&invoice),
+            );
+
+            let total: i128 = invoice.amounts.iter().sum();
+            check_and_emit_funding_checkpoints(&env, invoice_id, invoice.funded, total);
+
+            if invoice.funded >= total {
+                let in_group = env
+                    .storage()
+                    .persistent()
+                    .has(&invoice_group_key(invoice_id));
+                let guarded = invoice.prerequisite_id.is_some()
+                    || !invoice.tranches.is_empty()
+                    || !invoice.release_stages.is_empty()
+                    || in_group
+                    || !invoice.co_signers.is_empty()
+                    || env.storage().persistent().has(&cosigners_key(invoice_id))
+                    || (invoice.condition_oracle.is_some() && !invoice.condition_met)
+                    || (invoice.min_funding_bps > 0
+                        && invoice.funded
+                            < (invoice.amounts.iter().sum::<i128>()
+                                * invoice.min_funding_bps as i128
+                                / 10_000));
+                if guarded {
+                    save_invoice(&env, invoice_id, &invoice);
+                } else {
+                    Self::_release(&env, invoice_id, &mut invoice, &closer);
+                }
+            } else {
+                save_invoice(&env, invoice_id, &invoice);
+            }
+        } else {
+            save_invoice(&env, invoice_id, &invoice);
+        }
+
+        // Return any unspent channel balance to the payer.
+        if balance > 0 {
+            let token_client =
+                token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+            token_client.transfer(&env.current_contract_address(), &payer, &balance);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&channel_key(invoice_id, &payer));
+    }
+
     /// # Confidential payments
     /// When `commitment` is `Some`, the payment amount is hidden: `amount` is
     /// ignored and no funds move yet. The contract only stores `commitment` —
@@ -7251,8 +7383,16 @@ impl SplitContract {
         // Issue #142: when a price oracle is configured, query current price and
         // compute the oracle-adjusted total. oracle_price of 1_000_000 = 1.0 (identity).
         let total: i128 = if let Some(ref oracle) = invoice.price_oracle {
-            let oracle_price: i128 =
+            // Issue #37: oracle returns (price, last_updated) so freshness can be validated.
+            let (oracle_price, last_updated): (i128, u64) =
                 env.invoke_contract(oracle, &Symbol::new(env, "get_price"), Vec::new(env));
+            let age = env.ledger().timestamp().saturating_sub(last_updated);
+            let max_stale = constants::ORACLE_MAX_STALE_SECONDS;
+            assert!(
+                age <= max_stale,
+                "{}",
+                ContractError::StaleOraclePrice as u32
+            );
             let base_total: i128 = invoice.base_amounts.iter().sum();
             base_total * oracle_price / 1_000_000
         } else if let Some(ref oracle) = invoice.oracle {
@@ -7838,6 +7978,7 @@ impl SplitContract {
         invoice_id: u64,
         source_token: Address,
         amount: i128,
+        min_amount_out: i128,
         nonce: u64,
     ) {
         require_fn_not_paused(&env, &symbol_short!("pay_tok"));
@@ -7902,6 +8043,14 @@ impl SplitContract {
             args.push_back(invoice_token.into_val(&env));
             args.push_back(amount.into_val(&env));
             let converted: i128 = env.invoke_contract(&dex, &Symbol::new(&env, "swap"), args);
+            // Issue #35: enforce caller-specified minimum output to protect against
+            // sandwich attacks and MEV. Revert if the DEX returned fewer tokens than
+            // the payer's stated slippage tolerance allows.
+            assert!(
+                converted >= min_amount_out,
+                "{}",
+                ContractError::SlippageExceeded as u32
+            );
             converted
         };
 

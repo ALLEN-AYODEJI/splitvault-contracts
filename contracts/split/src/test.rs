@@ -3230,9 +3230,10 @@ struct MockOracle;
 
 #[contractimpl]
 impl MockOracle {
-    /// Returns a fixed price of 2.0 (2_000_000 in 6-decimal fixed-point).
-    pub fn get_price(_env: Env) -> i128 {
-        2_000_000
+    /// Returns a fixed price of 2.0 (2_000_000 in 6-decimal fixed-point) along
+    /// with the current ledger timestamp so the freshness check in `_pay` passes.
+    pub fn get_price(env: Env) -> (i128, u64) {
+        (2_000_000, env.ledger().timestamp())
     }
 }
 
@@ -3242,8 +3243,8 @@ mod identity_oracle_mod {
     pub struct IdentityOracle;
     #[contractimpl]
     impl IdentityOracle {
-        pub fn get_price(_env: Env) -> i128 {
-            1_000_000
+        pub fn get_price(env: Env) -> (i128, u64) {
+            (1_000_000, env.ledger().timestamp())
         }
     }
 }
@@ -4225,7 +4226,7 @@ fn test_pay_with_token_accepted_token_credited() {
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999, &opts);
 
     // Pay with the alternate token — DEX converts 1:1 so 300 gets credited.
-    c.pay_with_token(&payer, &id, &alt_token_id, &300_i128, &0);
+    c.pay_with_token(&payer, &id, &alt_token_id, &300_i128, &300_i128, &0);
 
     let invoice = c.get_invoice(&id);
     assert_eq!(invoice.funded, 300);
@@ -4253,7 +4254,7 @@ fn test_pay_with_token_non_listed_panics() {
     let id = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
 
     // Attempting to pay with an unlisted token must panic.
-    c.pay_with_token(&payer, &id, &unknown_token, &200_i128, &0);
+    c.pay_with_token(&payer, &id, &unknown_token, &200_i128, &0_i128, &0);
 }
 
 // ---------------------------------------------------------------------------
@@ -7824,7 +7825,7 @@ fn test_dex_unregistered_token_rejected() {
     let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
 
     // Unknown token not in accepted_tokens — should panic.
-    c.pay_with_token(&payer, &id, &unknown_token, &100_i128, &0);
+    c.pay_with_token(&payer, &id, &unknown_token, &100_i128, &0_i128, &0);
 }
 
 #[test]
