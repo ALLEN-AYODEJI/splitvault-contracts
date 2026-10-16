@@ -6412,8 +6412,10 @@ fn test_refund_available_after_deadline() {
     c.claim_refund(&payer, &id);
 
     assert_eq!(tk.balance(&payer), 200);
-    // Invoice still Pending (not bulk-refunded)
-    assert_eq!(c.get_invoice(&id).status, types::InvoiceStatus::Pending);
+    // Invoice deadline has passed — get_invoice now returns Expired dynamically
+    // (issue #59), even though the on-chain stored status is still Pending
+    // (no bulk-refund has been executed via refund()).
+    assert_eq!(c.get_invoice(&id).status, types::InvoiceStatus::Expired);
 }
 
 #[test]
