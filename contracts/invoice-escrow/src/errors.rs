@@ -46,4 +46,8 @@ pub enum Error {
     AlreadyFinalised = 18,
     /// Caller is not the blacklisted payer.
     NotBlacklistedPayer = 19,
+    /// Deposit is below the minimum required threshold.
+    DepositTooSmall = 20,
+    /// Reentrant call detected; this function is already executing.
+    Reentrancy = 21,
 }

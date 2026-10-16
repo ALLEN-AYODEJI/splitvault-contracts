@@ -29,6 +29,16 @@ fn registration_key(creator: &Address, contract: &Address) -> (Symbol, Address, 
 const MAX_CONTRACTS_PER_CREATOR: u32 = 5_000;
 
 // ---------------------------------------------------------------------------
+// Storage rent / TTL constants
+// ---------------------------------------------------------------------------
+
+/// Minimum TTL threshold before an extension is triggered (~60 days at 5 s/ledger).
+const REGISTRY_MIN_TTL: u32 = 518_400;
+
+/// Maximum TTL to extend to (~1 year at 5 s/ledger).
+const REGISTRY_MAX_TTL: u32 = 6_307_200;
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -99,16 +109,23 @@ impl Registry {
             "registry limit exceeded"
         );
 
-        // Append and persist.
+        // Append and persist, then bump TTL so the creator list survives
+        // even when the creator is only active once a year (#48).
         contracts.push_back(contract.clone());
         env.storage()
             .persistent()
             .set(&contracts_key, &contracts);
+        env.storage()
+            .persistent()
+            .extend_ttl(&contracts_key, REGISTRY_MIN_TTL, REGISTRY_MAX_TTL);
 
-        // Mark as registered.
+        // Mark as registered and bump TTL on the flag entry too (#48).
         env.storage()
             .persistent()
             .set(&registration_check_key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&registration_check_key, REGISTRY_MIN_TTL, REGISTRY_MAX_TTL);
 
         // Emit event.
         contract_registered(&env, &creator, &contract);
@@ -116,10 +133,19 @@ impl Registry {
 
     /// Return all registered contract addresses for a creator.
     pub fn get_contracts(env: Env, creator: Address) -> Vec<Address> {
-        env.storage()
+        let key = creator_contracts_key(&creator);
+        let contracts: Vec<Address> = env
+            .storage()
             .persistent()
-            .get(&creator_contracts_key(&creator))
-            .unwrap_or_else(|| Vec::new(&env))
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        // Bump TTL on every read so active registries never expire (#48).
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, REGISTRY_MIN_TTL, REGISTRY_MAX_TTL);
+        }
+        contracts
     }
 
     /// Return the number of registered contracts for a creator.
@@ -148,7 +174,7 @@ impl Registry {
 mod test {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Events as _},
+        testutils::{storage::Persistent as _, Address as _, Events as _},
         Address, Env, Symbol, TryFromVal, Val, Vec,
     };
 
@@ -290,5 +316,86 @@ mod test {
         assert!(!registry_client.is_registered(&creator, &contract_addr));
         registry_client.register(&creator, &contract_addr);
         assert!(registry_client.is_registered(&creator, &contract_addr));
+    }
+
+    // -----------------------------------------------------------------------
+    // #48 — TTL extension tests
+    // -----------------------------------------------------------------------
+
+    /// After `register`, both the creator-contracts list key and the
+    /// registration-check key must have a TTL >= REGISTRY_MIN_TTL (#48).
+    #[test]
+    fn test_register_extends_ttl_on_persistent_keys() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let registry_id = env.register(Registry, ());
+        let registry_client = RegistryClient::new(&env, &registry_id);
+        registry_client.initialize(&admin);
+
+        let creator = Address::generate(&env);
+        let contract_addr = Address::generate(&env);
+
+        registry_client.register(&creator, &contract_addr);
+
+        // Both persistent keys should now exist with TTL >= REGISTRY_MIN_TTL.
+        // We verify by reading the TTLs inside an as_contract closure.
+        env.as_contract(&registry_id, || {
+            let contracts_key = creator_contracts_key(&creator);
+            let reg_check_key = registration_key(&creator, &contract_addr);
+
+            let ttl_contracts = env.storage().persistent().get_ttl(&contracts_key);
+            let ttl_flag = env.storage().persistent().get_ttl(&reg_check_key);
+
+            assert!(
+                ttl_contracts >= REGISTRY_MIN_TTL,
+                "creator-contracts TTL {} is below REGISTRY_MIN_TTL {}",
+                ttl_contracts,
+                REGISTRY_MIN_TTL,
+            );
+            assert!(
+                ttl_flag >= REGISTRY_MIN_TTL,
+                "registration-check TTL {} is below REGISTRY_MIN_TTL {}",
+                ttl_flag,
+                REGISTRY_MIN_TTL,
+            );
+        });
+    }
+
+    /// `get_contracts` must bump the creator-contracts TTL on every read
+    /// so active registries never expire between registrations (#48).
+    #[test]
+    fn test_get_contracts_extends_ttl_on_read() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let registry_id = env.register(Registry, ());
+        let registry_client = RegistryClient::new(&env, &registry_id);
+        registry_client.initialize(&admin);
+
+        let creator = Address::generate(&env);
+        let contract_addr = Address::generate(&env);
+
+        // Prime the entry.
+        registry_client.register(&creator, &contract_addr);
+
+        // Verify that get_contracts still successfully returns the registered
+        // entry and (indirectly) bumps the TTL without panicking.
+        let contracts = registry_client.get_contracts(&creator);
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts.get_unchecked(0), contract_addr);
+
+        // Confirm the TTL was bumped to >= REGISTRY_MIN_TTL.
+        env.as_contract(&registry_id, || {
+            let contracts_key = creator_contracts_key(&creator);
+            let ttl = env.storage().persistent().get_ttl(&contracts_key);
+            assert!(
+                ttl >= REGISTRY_MIN_TTL,
+                "get_contracts did not extend TTL (ttl = {})",
+                ttl,
+            );
+        });
     }
 }
