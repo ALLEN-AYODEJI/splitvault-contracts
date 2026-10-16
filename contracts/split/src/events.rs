@@ -145,6 +145,19 @@ pub fn surplus_claimed(env: &Env, invoice_id: u64, payer: &Address, amount: i128
     );
 }
 
+/// Emitted when integer-division remainder dust from surplus distribution is
+/// credited to the final claimer rather than being permanently locked in the
+/// contract balance.
+/// Topics: (split, sur_rem, invoice_id)
+/// Data: (recipient, remainder_amount, event_seq)
+pub fn surplus_remainder_credited(env: &Env, invoice_id: u64, recipient: &Address, remainder: i128) {
+    let event_seq = next_seq(env, invoice_id);
+    env.events().publish(
+        (symbol_short!("split"), symbol_short!("sur_rem"), invoice_id),
+        (recipient.clone(), remainder, event_seq),
+    );
+}
+
 /// Emitted when an invoice is fully funded and funds are released.
 /// Topics: (split, released, invoice_id)
 /// Data: (recipients, event_seq)

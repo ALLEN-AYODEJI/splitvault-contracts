@@ -1931,6 +1931,7 @@ dependencies = [
 name = "split"
 version = "0.1.0"
 dependencies = [
+ "dashboard",
  "proptest",
  "soroban-sdk",
 ]

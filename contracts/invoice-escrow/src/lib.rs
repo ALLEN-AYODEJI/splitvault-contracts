@@ -63,6 +63,11 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
     (symbol_short!("blacklist"), payer.clone())
 }
 
+/// Instance storage: reentrancy lock flag.
+fn lock_key() -> Symbol {
+    symbol_short!("lock")
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -70,6 +75,12 @@ fn blacklist_key(payer: &Address) -> (Symbol, Address) {
 /// Number of ledgers during which a blacklisted payer can submit an appeal.
 /// ~30 minutes at 5s ledger close time.
 const APPEAL_WINDOW_LEDGERS: u32 = 360;
+
+/// Minimum deposit amount in stroops (1 XLM = 10_000_000 stroops).
+/// Prevents dust-spam attacks where an attacker floods the contract with
+/// 1-stroop deposits from thousands of addresses, bloating storage and
+/// exhausting refund instruction budgets.
+const MIN_DEPOSIT_AMOUNT: i128 = 1_000_000;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -83,6 +94,25 @@ fn require_admin(env: &Env) -> Address {
         .expect("not initialized");
     admin.require_auth();
     admin
+}
+
+/// Acquire the reentrancy lock. Returns `Err(Error::Reentrancy)` if already locked.
+fn acquire_lock(env: &Env) -> Result<(), Error> {
+    if env
+        .storage()
+        .instance()
+        .get::<_, bool>(&lock_key())
+        .unwrap_or(false)
+    {
+        return Err(Error::Reentrancy);
+    }
+    env.storage().instance().set(&lock_key(), &true);
+    Ok(())
+}
+
+/// Release the reentrancy lock.
+fn release_lock(env: &Env) {
+    env.storage().instance().set(&lock_key(), &false);
 }
 
 fn get_invoice(env: &Env, id: u64) -> Result<EscrowInvoice, Error> {
@@ -377,11 +407,20 @@ impl InvoiceEscrowContract {
     /// * [`Error::InvalidStatus`]      — Invoice is not `Pending` or `Active`.
     /// * [`Error::DeadlinePassed`]     — Deposit window has closed.
     /// * [`Error::InvalidAmount`]      — `amount` ≤ 0.
+    /// * [`Error::DepositTooSmall`]    — `amount` is below the minimum threshold.
     /// * [`Error::OverFunded`]         — Deposit would exceed `total_amount`.
     /// * [`Error::PayerBlacklisted`]   — Payer is finalised-blacklisted.
+    /// * [`Error::Reentrancy`]         — Reentrant call detected.
     pub fn deposit(env: Env, payer: Address, invoice_id: u64, amount: i128) -> Result<(), Error> {
+        acquire_lock(&env)?;
+
         if amount <= 0 {
+            release_lock(&env);
             return Err(Error::InvalidAmount);
+        }
+        if amount < MIN_DEPOSIT_AMOUNT {
+            release_lock(&env);
+            return Err(Error::DepositTooSmall);
         }
         payer.require_auth();
 
@@ -392,16 +431,25 @@ impl InvoiceEscrowContract {
             .get::<_, BlacklistEntry>(&blacklist_key(&payer))
         {
             if entry.finalised && entry.upheld {
+                release_lock(&env);
                 return Err(Error::PayerBlacklisted);
             }
         }
 
-        let mut invoice = get_invoice(&env, invoice_id)?;
+        let mut invoice = match get_invoice(&env, invoice_id) {
+            Ok(inv) => inv,
+            Err(e) => {
+                release_lock(&env);
+                return Err(e);
+            }
+        };
 
         if invoice.status != EscrowStatus::Pending && invoice.status != EscrowStatus::Active {
+            release_lock(&env);
             return Err(Error::InvalidStatus);
         }
         if env.ledger().timestamp() > invoice.deadline {
+            release_lock(&env);
             return Err(Error::DeadlinePassed);
         }
         let new_funded = invoice
@@ -409,6 +457,7 @@ impl InvoiceEscrowContract {
             .checked_add(amount)
             .expect("funded_amount overflow");
         if new_funded > invoice.total_amount {
+            release_lock(&env);
             return Err(Error::OverFunded);
         }
 
@@ -443,6 +492,7 @@ impl InvoiceEscrowContract {
             save_invoice(&env, invoice_id, &invoice);
         }
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -455,16 +505,27 @@ impl InvoiceEscrowContract {
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice was already released/refunded/cancelled.
     /// * [`Error::InsufficientFunding`] — Not fully funded yet.
+    /// * [`Error::Reentrancy`]         — Reentrant call detected.
     pub fn release(env: Env, invoice_id: u64) -> Result<(), Error> {
-        let mut invoice = get_invoice(&env, invoice_id)?;
+        acquire_lock(&env)?;
+
+        let mut invoice = match get_invoice(&env, invoice_id) {
+            Ok(inv) => inv,
+            Err(e) => {
+                release_lock(&env);
+                return Err(e);
+            }
+        };
 
         if invoice.status == EscrowStatus::Released
             || invoice.status == EscrowStatus::Refunded
             || invoice.status == EscrowStatus::Cancelled
         {
+            release_lock(&env);
             return Err(Error::InvalidStatus);
         }
         if invoice.funded_amount < invoice.total_amount {
+            release_lock(&env);
             return Err(Error::InsufficientFunding);
         }
 
@@ -487,6 +548,7 @@ impl InvoiceEscrowContract {
             },
         );
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -511,16 +573,27 @@ impl InvoiceEscrowContract {
     /// * [`Error::InvoiceNotFound`]    — Unknown invoice ID.
     /// * [`Error::InvalidStatus`]      — Invoice already released or refunded.
     /// * [`Error::DeadlineNotPassed`]  — Deadline has not expired yet.
+    /// * [`Error::Reentrancy`]         — Reentrant call detected.
     pub fn refund(env: Env, invoice_id: u64, payers: Vec<Address>) -> Result<(), Error> {
-        let mut invoice = get_invoice(&env, invoice_id)?;
+        acquire_lock(&env)?;
+
+        let mut invoice = match get_invoice(&env, invoice_id) {
+            Ok(inv) => inv,
+            Err(e) => {
+                release_lock(&env);
+                return Err(e);
+            }
+        };
 
         if invoice.status == EscrowStatus::Released
             || invoice.status == EscrowStatus::Refunded
             || invoice.status == EscrowStatus::Cancelled
         {
+            release_lock(&env);
             return Err(Error::InvalidStatus);
         }
         if env.ledger().timestamp() <= invoice.deadline {
+            release_lock(&env);
             return Err(Error::DeadlineNotPassed);
         }
 
@@ -551,6 +624,8 @@ impl InvoiceEscrowContract {
             invoice.status = EscrowStatus::Refunded;
         }
         save_invoice(&env, invoice_id, &invoice);
+
+        release_lock(&env);
         Ok(())
     }
 
@@ -625,6 +700,7 @@ impl InvoiceEscrowContract {
         let now = env.ledger().timestamp();
         let entry = BlacklistEntry {
             banned_at: now,
+            ban_ledger: env.ledger().sequence(),
             appeal_hash: None,
             finalised: false,
             upheld: false,
@@ -675,14 +751,14 @@ impl InvoiceEscrowContract {
             return Err(Error::AlreadyFinalised);
         }
 
-        // Check appeal window: must be within APPEAL_WINDOW_LEDGERS of ban.
-        // Uses rough timestamp conversion (~5s per ledger). For production,
-        // store `ban_ledger` in BlacklistEntry for precise ledger-based check.
-        let now = env.ledger().timestamp();
+        // Check appeal window using precise ledger sequence numbers.
+        // The appeal must be submitted within APPEAL_WINDOW_LEDGERS ledgers of
+        // the ban, eliminating drift from variable ledger close times.
+        let current_ledger = env.ledger().sequence();
         let appeal_deadline = entry
-            .banned_at
-            .saturating_add(APPEAL_WINDOW_LEDGERS as u64 * 5);
-        if now > appeal_deadline {
+            .ban_ledger
+            .saturating_add(APPEAL_WINDOW_LEDGERS);
+        if current_ledger > appeal_deadline {
             return Err(Error::AppealWindowExpired);
         }
 
