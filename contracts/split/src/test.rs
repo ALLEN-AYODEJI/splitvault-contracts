@@ -8445,6 +8445,8 @@ fn test_create_invoice_penalty_bps_at_max_ok() {
 
     let mut opts = default_options(&env);
     opts.penalty_bps = Some(10_000);
+    // Issue #7: penalty_bps > 0 requires a valid penalty_deadline.
+    opts.penalty_deadline = Some(5_000);
 
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
     assert!(id >= 1);
