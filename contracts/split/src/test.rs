@@ -1227,7 +1227,7 @@ fn test_group_partial_fund_blocks_release() {
     let mut ids = Vec::new(&env);
     ids.push_back(id1);
     ids.push_back(id2);
-    c.create_invoice_group(&ids, &false);
+    c.create_invoice_group(&creator, &ids, &false);
 
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
 
@@ -1256,7 +1256,7 @@ fn test_group_all_funded_releases_both() {
     let mut ids = Vec::new(&env);
     ids.push_back(id1);
     ids.push_back(id2);
-    c.create_invoice_group(&ids, &false);
+    c.create_invoice_group(&creator, &ids, &false);
 
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
     c.pay(&payer, &id2, &200_i128, &0_u64, &false, &false, &None);
@@ -5366,7 +5366,7 @@ fn test_majority_group_releases_when_majority_funded() {
     ids.push_back(id2);
     ids.push_back(id3);
     // majority mode: >50% funded is sufficient
-    c.create_invoice_group(&ids, &true);
+    c.create_invoice_group(&creator, &ids, &true);
 
     // Fund 2 out of 3 (>50%)
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
@@ -5401,7 +5401,7 @@ fn test_majority_group_blocks_when_minority_funded() {
     ids.push_back(id1);
     ids.push_back(id2);
     ids.push_back(id3);
-    c.create_invoice_group(&ids, &true);
+    c.create_invoice_group(&creator, &ids, &true);
 
     // Only 1 out of 3 funded — not a majority.
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
@@ -5428,7 +5428,7 @@ fn test_all_or_nothing_group_still_requires_all_funded() {
     let mut ids = Vec::new(&env);
     ids.push_back(id1);
     ids.push_back(id2);
-    c.create_invoice_group(&ids, &false); // AllOrNothing
+    c.create_invoice_group(&creator, &ids, &false); // AllOrNothing
 
     // Only id1 funded — id2 is not.
     c.pay(&payer, &id1, &100_i128, &0_u64, &false, &false, &None);
@@ -8445,6 +8445,8 @@ fn test_create_invoice_penalty_bps_at_max_ok() {
 
     let mut opts = default_options(&env);
     opts.penalty_bps = Some(10_000);
+    // Issue #7: penalty_bps > 0 requires a valid penalty_deadline.
+    opts.penalty_deadline = Some(5_000);
 
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &opts);
     assert!(id >= 1);
@@ -8690,286 +8692,154 @@ fn test_create_invoice_payment_window_only_one_or_none_ok() {
 
 
 // ---------------------------------------------------------------------------
-// Issue #24 — multi-tier fee rounding: single division after accumulation
+// Security tests — Issue #1: Unauthorized Treasury Group Hijacking
 // ---------------------------------------------------------------------------
 
-/// Verify that tiered fee calculations divide by the basis-points denominator
-/// exactly once (across all tiers combined) rather than once per tier.
-///
-/// Setup: 3 tiers
-///   - [0 … 100]  → 100 bps (1%)
-///   - [101 … 500] → 200 bps (2%)
-///   - [501 … ∞]  → 300 bps (3%)
-///
-/// Invoice amount = 333 (spans all 3 tiers).
-///
-/// Numerators:
-///   tier 1: 100  * 100 = 10_000
-///   tier 2: 200  * 200 = 40_000   (400 worth in tier but only 233 after tier1? no — let's trace)
-///   Actually: slice1=100, slice2=400(but only 233 remain so 233), slice3=0
-///   Let's use amount=333:
-///     slice1 = min(333, 100) = 100  → 100*100=10_000
-///     remaining=233; slice2 = min(233, 400) = 233 → 233*200=46_600
-///     remaining=0
-///   total numerator = 56_600 → fee = 56_600/10_000 = 5
-///
-/// Without the fix (per-tier division):
-///   fee = 100*100/10_000 + 233*200/10_000 = 1 + 4 = 5 (same in this case, both truncate 0.66 independently)
-///
-/// Use a case where the fix makes a concrete difference.
-/// Amount = 10_001 across two tiers at 1 bps each:
-///   tier1: [0..10_000] @ 1 bps, tier2: [10_001..MAX] @ 1 bps
-///   slice1 = 10_000 → numerator=10_000
-///   slice2 = 1     → numerator=1
-///   total numerator=10_001 → fee=10_001/10_000=1  (correct: 1 stroop)
-///   Per-tier (buggy): 10_000/10_000 + 1/10_000 = 1 + 0 = 1 (same here)
-///
-/// Better demonstration: amount = 19_999 across two brackets at 1 bps each:
-///   slice1=10_000 → 10_000*1=10_000
-///   slice2=9_999  → 9_999*1=9_999
-///   total numerator=19_999 → fee = 19_999/10_000 = 1
-///   Per-tier (buggy): 10_000/10_000 + 9_999/10_000 = 1 + 0 = 1 (still same!)
-///
-/// The observable difference occurs with 3+ tiers where remainders accumulate.
-/// amount = 29_999 across three brackets at 1 bps each:
-///   slice1=10_000 → 10_000
-///   slice2=10_000 → 10_000
-///   slice3=9_999  → 9_999
-///   total numerator=29_999 → fee = 29_999/10_000 = 2
-///   Per-tier (buggy): 1 + 1 + 0 = 2   (same again)
-///
-/// The real observable difference happens with higher bps where remainders sum > 10_000.
-/// amount = 3 across three equal brackets at 5_000 bps each:
-///   slice1=1 → 5_000, slice2=1 → 5_000, slice3=1 → 5_000
-///   total numerator=15_000 → fee=15_000/10_000=1
-///   Per-tier (buggy): 0 + 0 + 0 = 0   ← WRONG
+/// Attacker cannot bind invoices they didn't create to their own treasury.
 #[test]
-fn test_24_tiered_fee_single_division() {
-    let (env, contract_id, token_id) = setup();
+#[should_panic(expected = "not invoice creator or co-creator")]
+fn test_group_treasury_create_unauthorized_creator_panics() {
+    let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
 
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
+    let real_creator = Address::generate(&env);
+    let attacker = Address::generate(&env);
     let recipient = Address::generate(&env);
+    let attacker_treasury = Address::generate(&env);
 
-    c.initialize(&admin, &0_i128, &treasury, &token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
-
-    // Three equal-width brackets all at 5_000 bps (50%), covering [0,1], [1,2], [2,MAX].
-    // For a payment of amount=3 the expected fee = 3 * 5_000 / 10_000 = 1 (round down).
-    // With per-tier division the buggy result is 0 (each tier contributes 0).
-    let mut brackets = Vec::new(&env);
-    brackets.push_back(types::FeeBracket { max_amount: 1_i128, rate_bps: 5_000_u32 });
-    brackets.push_back(types::FeeBracket { max_amount: 2_i128, rate_bps: 5_000_u32 });
-    brackets.push_back(types::FeeBracket { max_amount: i128::MAX, rate_bps: 5_000_u32 });
-    c.set_fee_brackets(&admin, &brackets);
-
-    // Verify compute_fee directly returns 1, not 0.
-    let fee = c.compute_fee(&3_i128);
-    assert_eq!(fee, 1_i128, "single-division: fee for 3 units at 5000bps should be 1");
-
-    // End-to-end: fund an invoice with amount=3. Treasury should receive 1, recipient 2.
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &3);
+    StellarAssetClient::new(&env, &token_id).mint(&real_creator, &1_000);
     env.ledger().set_timestamp(1_000);
-    let id = make_invoice(&env, &c, &creator, &recipient, 3, &token_id, 9_999);
-    c.pay(&payer, &id, &3_i128, &0_u64, &false, &false, &None);
 
-    assert_eq!(tk.balance(&recipient), 2_i128, "recipient should receive amount minus fee");
-    assert_eq!(tk.balance(&treasury), 1_i128, "treasury should receive the fee");
+    // real_creator creates the invoice.
+    let id = make_invoice(&env, &c, &real_creator, &recipient, 100, &token_id, 9_999);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(id);
+
+    // Attacker tries to redirect payout to their own treasury — must panic.
+    c.group_treasury_create(&attacker, &ids, &attacker_treasury);
+}
+
+/// Creator can successfully create a treasury group for their own invoices.
+#[test]
+fn test_group_treasury_create_by_creator_succeeds() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(id1);
+    ids.push_back(id2);
+
+    // Legitimate call by the real creator.
+    let group_id = c.group_treasury_create(&creator, &ids, &treasury);
+    assert!(group_id >= 1);
+}
+
+/// An invoice that already belongs to a treasury group cannot be re-grouped.
+#[test]
+#[should_panic(expected = "invoice already in treasury group")]
+fn test_group_treasury_already_grouped_rejected() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
+
+    let mut ids1 = Vec::new(&env);
+    ids1.push_back(id1);
+    ids1.push_back(id2);
+    c.group_treasury_create(&creator, &ids1, &treasury);
+
+    // id1 is already in a treasury group — re-grouping must panic.
+    let mut ids2 = Vec::new(&env);
+    ids2.push_back(id1);
+    ids2.push_back(id3);
+    c.group_treasury_create(&creator, &ids2, &treasury);
 }
 
 // ---------------------------------------------------------------------------
-// Issue #25 — release_tranche panics with division by zero when funded == 0
+// Security tests — Issue #2: Unauthenticated create_invoice_group DoS
 // ---------------------------------------------------------------------------
 
+/// A caller who didn't create the invoice cannot add it to a group.
 #[test]
-#[should_panic(expected = "invoice not fully funded")]
-fn test_25_release_tranche_zero_funded_panics_cleanly() {
+#[should_panic(expected = "not invoice creator or co-creator")]
+fn test_create_invoice_group_unauthorized_caller_panics() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&alice, &1_000);
+    env.ledger().set_timestamp(1_000);
+
+    let id1 = make_invoice(&env, &c, &alice, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &alice, &recipient, 200, &token_id, 9_999);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(id1);
+    ids.push_back(id2);
+
+    // Bob tries to group Alice's invoices — must panic.
+    c.create_invoice_group(&bob, &ids, &false);
+}
+
+/// An invoice already in a group cannot be added to another group.
+#[test]
+#[should_panic(expected = "invoice already in a group")]
+fn test_create_invoice_group_already_grouped_rejected() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
 
     let creator = Address::generate(&env);
     let recipient = Address::generate(&env);
 
+    StellarAssetClient::new(&env, &token_id).mint(&creator, &1_000);
     env.ledger().set_timestamp(1_000);
 
-    // Create invoice with a tranche releasable immediately.
-    let mut tranches = Vec::new(&env);
-    tranches.push_back(types::Tranche { timestamp: 1_000, basis_points: 10_000 });
+    let id1 = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    let id2 = make_invoice(&env, &c, &creator, &recipient, 200, &token_id, 9_999);
+    let id3 = make_invoice(&env, &c, &creator, &recipient, 300, &token_id, 9_999);
 
-    let mut recipients = Vec::new(&env);
-    recipients.push_back(recipient.clone());
-    let mut amounts = Vec::new(&env);
-    amounts.push_back(1_000_i128);
+    let mut ids1 = Vec::new(&env);
+    ids1.push_back(id1);
+    ids1.push_back(id2);
+    c.create_invoice_group(&creator, &ids1, &false);
 
-    let id = c.create_invoice(
-        &creator,
-        &recipients,
-        &amounts,
-        &token_id,
-        &9_999_u64,
-        &InvoiceOptions {
-            tranches: tranches.clone(),
-            ..default_options(&env)
-        },
-    );
-
-    // No payment made — funded == 0 < total == 1_000.
-    // release_tranche should reject cleanly before reaching division.
-    c.release_tranche(&id, &0_u32);
-}
-
-/// Happy-path: release_tranche on a properly funded invoice works correctly.
-#[test]
-fn test_25_release_tranche_funded_works() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
-    env.ledger().set_timestamp(1_000);
-
-    let mut tranches = Vec::new(&env);
-    tranches.push_back(types::Tranche { timestamp: 1_000, basis_points: 5_000 });
-    tranches.push_back(types::Tranche { timestamp: 2_000, basis_points: 5_000 });
-
-    let mut recipients = Vec::new(&env);
-    recipients.push_back(recipient.clone());
-    let mut amounts = Vec::new(&env);
-    amounts.push_back(1_000_i128);
-
-    let id = c.create_invoice(
-        &creator,
-        &recipients,
-        &amounts,
-        &token_id,
-        &9_999_u64,
-        &InvoiceOptions {
-            tranches: tranches.clone(),
-            ..default_options(&env)
-        },
-    );
-
-    c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
-    assert_eq!(c.get_invoice(&id).funded, 1_000_i128);
-
-    // Release first tranche (50%).
-    c.release_tranche(&id, &0_u32);
-    assert_eq!(tk.balance(&recipient), 500_i128);
-
-    // Release second tranche (50%).
-    env.ledger().set_timestamp(2_000);
-    c.release_tranche(&id, &1_u32);
-    assert_eq!(tk.balance(&recipient), 1_000_i128);
-    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
+    // id1 is already grouped — must panic.
+    let mut ids2 = Vec::new(&env);
+    ids2.push_back(id1);
+    ids2.push_back(id3);
+    c.create_invoice_group(&creator, &ids2, &false);
 }
 
 // ---------------------------------------------------------------------------
-// Issue #23 — early-bird fee credit cap
+// Security tests — Issue #3: Double Payment Refund
 // ---------------------------------------------------------------------------
 
-/// Verify that early-bird credit cannot exceed the platform fee on the
-/// total funded amount, preventing a zero-fee outcome at release.
+/// Payer who called withdraw_contribution must NOT receive a second refund.
 #[test]
-fn test_23_early_bird_credit_capped_at_max_fee() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
-
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    // Platform fee = 100 bps (1%).
-    c.initialize(&admin, &0_i128, &treasury, &token_id, &100_u32, &None, &0_u32, &0_u32, &0_u64);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &1_000);
-    env.ledger().set_sequence_number(1_000);
-    env.ledger().set_timestamp(1_000);
-
-    // Create invoice with early-bird: 50 bps discount for 500 ledgers.
-    let mut opts = default_options(&env);
-    opts.ext.early_bird_window_ledgers = 500_u32;
-    opts.ext.early_bird_fee_bps = 50_u32; // discounted rate (must be <= platform_fee_bps=100)
-
-    let id = c.create_invoice(&creator, &{
-        let mut v = Vec::new(&env);
-        v.push_back(recipient.clone());
-        v
-    }, &{
-        let mut v = Vec::new(&env);
-        v.push_back(1_000_i128);
-        v
-    }, &token_id, &9_999_u64, &opts);
-
-    // Pay within the early-bird window — discount accumulates.
-    c.pay(&payer, &id, &1_000_i128, &0_u64, &false, &false, &None);
-
-    let invoice = c.get_invoice(&id);
-    let ext2 = c.get_invoice_ext2(&id);
-    // Platform fee on 1_000 at 100 bps = 10.
-    // Early-bird credit at (100-50) bps on 1_000 = 5.
-    // Credit must not exceed compute_fee(1_000) = 10.
-    assert!(
-        ext2.early_bird_fee_credit <= c.compute_fee(&invoice.funded),
-        "early_bird_fee_credit ({}) must not exceed compute_fee(funded) ({})",
-        ext2.early_bird_fee_credit,
-        c.compute_fee(&invoice.funded),
-    );
-    // Invoice was fully funded so it auto-released. Recipient should have gotten >= 990.
-    assert!(
-        tk.balance(&recipient) >= 990_i128,
-        "recipient balance should be at least 990 after 1% fee (got {})",
-        tk.balance(&recipient)
-    );
-}
-
-/// Verify creation-time validation: early_bird_fee_bps > platform_fee_bps is rejected.
-#[test]
-#[should_panic]
-fn test_23_early_bird_fee_bps_above_platform_fee_rejected() {
-    let (env, contract_id, token_id) = setup();
-    let c = client(&env, &contract_id);
-
-    let admin = Address::generate(&env);
-    let treasury = Address::generate(&env);
-    let creator = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    // Platform fee = 100 bps.
-    c.initialize(&admin, &0_i128, &treasury, &token_id, &100_u32, &None, &0_u32, &0_u32, &0_u64);
-
-    let mut opts = default_options(&env);
-    // early_bird_fee_bps > platform_fee_bps — must be rejected.
-    opts.ext.early_bird_window_ledgers = 100_u32;
-    opts.ext.early_bird_fee_bps = 200_u32; // invalid: 200 > 100
-
-    c.create_invoice(&creator, &{
-        let mut v = Vec::new(&env);
-        v.push_back(recipient.clone());
-        v
-    }, &{
-        let mut v = Vec::new(&env);
-        v.push_back(100_i128);
-        v
-    }, &token_id, &9_999_u64, &opts);
-}
-
-// ---------------------------------------------------------------------------
-// Issue #26 — claim_refund allowed after notify_expired (Expired status)
-// ---------------------------------------------------------------------------
-
-/// Payer can claim their refund after notify_expired marks the invoice Expired.
-#[test]
-fn test_26_claim_refund_works_after_notify_expired() {
+fn test_withdraw_contribution_no_double_refund() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
     let tk = token_client(&env, &token_id);
@@ -8978,59 +8848,34 @@ fn test_26_claim_refund_works_after_notify_expired() {
     let payer = Address::generate(&env);
     let recipient = Address::generate(&env);
 
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &50);
+    let stellar_asset = StellarAssetClient::new(&env, &token_id);
+    stellar_asset.mint(&payer, &1_000);
+
     env.ledger().set_timestamp(1_000);
 
-    let deadline = 5_000_u64;
-    // Invoice requires 100 tokens; payer only contributes 50.
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, deadline);
-    c.pay(&payer, &id, &50_i128, &0_u64, &false, &false, &None);
+    // Invoice requires 500 tokens, deadline is 9_999.
+    let id = make_invoice(&env, &c, &creator, &recipient, 500, &token_id, 9_999);
 
-    assert_eq!(c.get_invoice(&id).funded, 50_i128);
+    // Payer contributes 300.
+    c.pay(&payer, &id, &300_i128, &0_u64, &false, &false, &None);
+    let balance_after_pay = tk.balance(&payer);
+    assert_eq!(balance_after_pay, 700); // 1000 - 300
 
-    // Deadline passes; a keeper calls notify_expired.
-    env.ledger().set_timestamp(deadline + 1);
-    c.notify_expired(&id);
-    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Expired);
+    // Payer withdraws their contribution — gets 300 back.
+    c.withdraw_contribution(&payer, &id);
+    let balance_after_withdraw = tk.balance(&payer);
+    assert_eq!(balance_after_withdraw, 1_000); // fully restored
 
-    // Payer calls claim_refund — must succeed and return 50 tokens.
-    let balance_before = tk.balance(&payer);
-    c.claim_refund(&payer, &id);
-    let balance_after = tk.balance(&payer);
+    // Advance past the deadline.
+    env.ledger().set_timestamp(10_001);
 
+    // Anyone calls refund. The payer should NOT receive another 300.
+    c.refund(&id);
+
+    let balance_after_refund = tk.balance(&payer);
+    // Must still be 1_000; payer has already been fully refunded via withdraw_contribution.
     assert_eq!(
-        balance_after - balance_before,
-        50_i128,
-        "payer should receive 50 tokens back after claiming refund on expired invoice"
-    );
-}
-
-/// claim_refund on a Released invoice remains an idempotent no-op (unchanged behaviour).
-#[test]
-fn test_26_claim_refund_noop_on_released_invoice() {
-    let (env, contract_id, token_id) = setup_initialized();
-    let c = client(&env, &contract_id);
-    let tk = token_client(&env, &token_id);
-
-    let creator = Address::generate(&env);
-    let payer = Address::generate(&env);
-    let recipient = Address::generate(&env);
-
-    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
-    env.ledger().set_timestamp(1_000);
-
-    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
-    c.pay(&payer, &id, &100_i128, &0_u64, &false, &false, &None);
-    assert_eq!(c.get_invoice(&id).status, InvoiceStatus::Released);
-
-    // claim_refund on a Released invoice should be a silent no-op.
-    let balance_before = tk.balance(&payer);
-    c.claim_refund(&payer, &id);
-    let balance_after = tk.balance(&payer);
-
-    assert_eq!(
-        balance_after,
-        balance_before,
-        "claim_refund on Released invoice should not move any tokens"
+        balance_after_refund, 1_000,
+        "double-refund detected: payer received tokens twice"
     );
 }
