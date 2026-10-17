@@ -3782,7 +3782,7 @@ impl SplitContract {
             DisputeOutcome::Refund | DisputeOutcome::Refunded => {
                 record.status = DisputeStatus::Resolved;
                 env.storage().persistent().set(&dispute_record_key(invoice_id), &record);
-                let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+                let token_client = token::Client::new(&env, &funding_token_for(&invoice));
                 let mut totals: Map<Address, i128> = Map::new(&env);
                 for payment in invoice.payments.iter() {
                     let prev = totals.get(payment.payer.clone()).unwrap_or(0);
@@ -3868,6 +3868,14 @@ impl SplitContract {
         );
         assert!(invoice.disputed, "invoice is not disputed");
 
+        // Issue #58: when a creator cosigner is configured the invoice requires
+        // dual-party authorisation for all state transitions — dispute resolution
+        // is no exception.  A compromised arbiter alone must not be able to
+        // unilaterally release or redirect funds.
+        if let Some(ref cos) = invoice.creator_cosigner.clone() {
+            cos.require_auth();
+        }
+
         match resolution {
             ResolveAction::Release => {
                 let caller = env.current_contract_address();
@@ -3890,7 +3898,7 @@ impl SplitContract {
                 }
 
                 let token_client =
-                    token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+                    token::Client::new(&env, &funding_token_for(&invoice));
                 let mut totals: Map<Address, i128> = Map::new(&env);
                 for payment in invoice.payments.iter() {
                     let prev = totals.get(payment.payer.clone()).unwrap_or(0);
@@ -6932,7 +6940,7 @@ impl SplitContract {
         }
 
         if balance > 0 {
-            let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+            let token_client = token::Client::new(&env, &funding_token_for(&invoice));
             token_client.transfer(&env.current_contract_address(), &payer, &balance);
         }
 
@@ -8871,7 +8879,7 @@ impl SplitContract {
         if total <= 0 {
             return;
         }
-        let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(env, &funding_token_for(&invoice));
         while invoice.milestones_released < invoice.milestones.len() {
             let next_idx = invoice.milestones_released;
             let milestone_bps = invoice.milestones.get(next_idx).unwrap();
@@ -8965,7 +8973,7 @@ impl SplitContract {
                 .instance()
                 .get::<_, Address>(&soroban_sdk::symbol_short!("dex_ctr"))
             {
-                let token = invoice.tokens.get(0).expect("no token");
+                let token = funding_token_for(&invoice);
                 let path: Vec<Address> = env.invoke_contract(
                     &dex_router,
                     &soroban_sdk::Symbol::new(env, "get_path"),
@@ -10033,7 +10041,7 @@ impl SplitContract {
         };
         assert!(refund_amount > 0, "no surplus claimable");
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
         token_client.transfer(&env.current_contract_address(), &payer, &refund_amount);
 
         env.storage()
@@ -10446,7 +10454,7 @@ impl SplitContract {
 
         let stage_bps = invoice.release_stages.get(stage_idx).unwrap();
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
 
         let platform_fee_bps: u32 = env
             .storage()
@@ -10504,7 +10512,7 @@ impl SplitContract {
                 .instance()
                 .get(&treasury_key())
                 .expect("treasury not set");
-            Self::distribute_fee(&env, total_fee, &invoice.tokens.get(0).expect("no token"), &treasury);
+            Self::distribute_fee(&env, total_fee, &funding_token_for(&invoice), &treasury);
         }
 
         if total_tax > 0 {
@@ -10590,7 +10598,7 @@ impl SplitContract {
         assert!(amount > 0, "amount must be positive");
         assert!(amount <= invoice.funded, "amount exceeds funded balance");
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
 
         let n = invoice.recipients.len();
         let use_priorities = !invoice.priorities.is_empty();
@@ -11352,7 +11360,7 @@ impl SplitContract {
         }
         invoice.completion_time = Some(env.ledger().timestamp());
         if invoice.insurance_fund > 0 {
-            let token_client = token::Client::new(env, &invoice.tokens.get(0).expect("no token"));
+            let token_client = token::Client::new(env, &funding_token_for(&invoice));
             token_client.transfer(
                 &env.current_contract_address(),
                 &invoice.creator,
@@ -11560,7 +11568,7 @@ impl SplitContract {
                     }
                     ResolveAction::Refund => {
                         let token_client =
-                            token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+                            token::Client::new(&env, &funding_token_for(&invoice));
                         let mut totals: Map<Address, i128> = Map::new(&env);
                         for payment in invoice.payments.iter() {
                             let prev = totals.get(payment.payer.clone()).unwrap_or(0);
@@ -11635,7 +11643,7 @@ impl SplitContract {
         assert!(bps <= 10_000, "bps must be ≤ 10000");
         assert!(invoice.funded > 0, "no funds to refund");
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
 
         let mut total_refunded: i128 = 0;
         for payment in invoice.payments.iter() {
@@ -11741,7 +11749,7 @@ impl SplitContract {
             panic!("auction ended; settle auction");
         }
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
 
         // Aggregate payments from all shards (issue #177).
         let mut totals: Map<Address, i128> = Map::new(&env);
@@ -12133,7 +12141,7 @@ impl SplitContract {
             "bid must be higher than current highest bid"
         );
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
         token_client.transfer(&bidder, &env.current_contract_address(), &amount);
 
         invoice.bids.push_back(Bid {
@@ -12158,7 +12166,7 @@ impl SplitContract {
             "invoice is not pending"
         );
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
 
         let mut winner_idx: Option<u32> = None;
         let mut highest_amount: i128 = 0;
@@ -12324,7 +12332,7 @@ impl SplitContract {
 
         if invoice.funded > 0 {
             // Refund all payments.
-            let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+            let token_client = token::Client::new(&env, &funding_token_for(&invoice));
 
             // Aggregate payments from all shards (issue #177).
             let mut totals: Map<Address, i128> = Map::new(&env);
@@ -12410,7 +12418,7 @@ impl SplitContract {
         } else {
             if invoice.bonus_pool > 0 {
                 let token_client =
-                    token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+                    token::Client::new(&env, &funding_token_for(&invoice));
                 token_client.transfer(
                     &env.current_contract_address(),
                     &invoice.creator,
@@ -12703,7 +12711,7 @@ impl SplitContract {
         );
         assert!(amount > 0, "amount must be positive");
 
-        let token = invoice.tokens.get(0).expect("no token");
+        let token = funding_token_for(&invoice);
 
         invoice.recipients.push_back(recipient.clone());
         invoice.amounts.push_back(amount);
@@ -13116,7 +13124,7 @@ impl SplitContract {
         }
         invoice.funded -= total_paid;
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
         token_client.transfer(&env.current_contract_address(), &payer, &total_paid);
 
         // Decrement credit score by 2 on early withdrawal (floor 0) (issue #38).
@@ -13217,7 +13225,7 @@ impl SplitContract {
         invoice.claimed.set(idx, already_claimed + claimable);
         save_invoice(&env, invoice_id, &invoice);
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
         token_client.transfer(&env.current_contract_address(), &recipient, &claimable);
     }
 
@@ -14610,7 +14618,7 @@ impl SplitContract {
             return; // No contribution to refund.
         }
 
-        let token_client = token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+        let token_client = token::Client::new(&env, &funding_token_for(&invoice));
         token_client.transfer(&env.current_contract_address(), &payer, &payer_total);
 
         // Record that this payer has claimed.
@@ -14925,7 +14933,7 @@ impl SplitContract {
                     .set(&dispute_record_key(invoice_id), &record);
 
                 let token_client =
-                    token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+                    token::Client::new(&env, &funding_token_for(&invoice));
                 let mut totals: Map<Address, i128> = Map::new(&env);
                 for payment in invoice.payments.iter() {
                     let prev = totals.get(payment.payer.clone()).unwrap_or(0);
@@ -14971,7 +14979,7 @@ impl SplitContract {
                     .set(&dispute_record_key(invoice_id), &record);
 
                 let token_client =
-                    token::Client::new(&env, &invoice.tokens.get(0).expect("no token"));
+                    token::Client::new(&env, &funding_token_for(&invoice));
                 let mut totals: Map<Address, i128> = Map::new(&env);
                 for payment in invoice.payments.iter() {
                     let prev = totals.get(payment.payer.clone()).unwrap_or(0);
@@ -15765,7 +15773,7 @@ impl SplitContract {
             "payout not yet claimable"
         );
         let invoice = load_invoice(&env, invoice_id);
-        let token = invoice.tokens.get(0).expect("invoice has no tokens");
+        let token = funding_token_for(&invoice);
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(
             &env.current_contract_address(),
@@ -15866,23 +15874,31 @@ impl SplitContract {
         for member_id in members.iter() {
             let mut invoice = load_invoice(env, member_id);
             if invoice.status == InvoiceStatus::Pending {
+                // Issue #57: collect all pending refunds before mutating state.
+                // Building the full list first ensures that if any transfer
+                // fails, we have not yet committed a Refunded status that would
+                // make the funds unrecoverable.
+                let mut pending_refunds: Vec<(Address, i128)> = Vec::new(env);
+                for payment in invoice.payments.iter() {
+                    let amount = payment.amount + payment.tip;
+                    if amount > 0 {
+                        pending_refunds.push_back((payment.payer.clone(), amount));
+                    }
+                }
+
+                // Commit state change only after the refund list is finalised.
                 invoice.status = InvoiceStatus::Refunded;
                 save_invoice(env, member_id, &invoice);
 
-                // Process refunds for all payers
-                for payment in invoice.payments.iter() {
-                    let token_client = token::Client::new(env, &invoice.tokens.get(0).unwrap());
+                // Execute all transfers after state is committed.
+                let token_client = token::Client::new(env, &funding_token_for(&invoice));
+                for (payer, amount) in pending_refunds.iter() {
                     token_client.transfer(
                         &env.current_contract_address(),
-                        &payment.payer,
-                        &(payment.amount + payment.tip),
+                        &payer,
+                        &amount,
                     );
-                    events::payer_refunded(
-                        env,
-                        member_id,
-                        &payment.payer,
-                        payment.amount + payment.tip,
-                    );
+                    events::payer_refunded(env, member_id, &payer, amount);
                 }
             }
         }
