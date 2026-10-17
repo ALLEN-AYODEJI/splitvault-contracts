@@ -9,3 +9,7 @@ pub const MIN_INVOICE_TTL_LEDGERS: u32 = 518_400;
 /// Set to ~1 year of ledgers to allow long-term invoice archival and dispute resolution.
 /// Invoices can be bumped multiple times within this window to extend their lifetime.
 pub const MAX_INVOICE_TTL_LEDGERS: u32 = 31_536_000;
+
+/// Issue #37: Maximum age (in seconds) of an oracle price before it is considered stale.
+/// Defaults to 300 seconds (5 minutes); configurable via `set_oracle_max_staleness`.
+pub const ORACLE_MAX_STALE_SECONDS: u64 = 300;

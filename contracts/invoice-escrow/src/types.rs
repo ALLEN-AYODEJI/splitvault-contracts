@@ -115,6 +115,10 @@ pub struct EscrowReleased {
 pub struct BlacklistEntry {
     /// Unix timestamp when the blacklist entry was created.
     pub banned_at: u64,
+    /// Ledger sequence number when the blacklist entry was created.
+    /// Used for precise appeal-window calculation instead of a timestamp
+    /// approximation, eliminating drift caused by variable ledger close times.
+    pub ban_ledger: u32,
     /// Optional appeal hash submitted by the payer (32-byte hash).
     pub appeal_hash: Option<BytesN<32>>,
     /// Whether the blacklist entry has been finalised by the admin.

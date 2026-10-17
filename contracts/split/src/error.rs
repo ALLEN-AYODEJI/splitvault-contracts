@@ -145,4 +145,6 @@ pub enum ContractError {
     AlreadyPaid = 65,
     /// Recipient list is shorter than the configured minimum recipient count.
     TooFewRecipients = 66,
+    /// Issue #29: A stage release was attempted out of order; the preceding stage has not been released yet.
+    PriorStageNotReleased = 67,
 }

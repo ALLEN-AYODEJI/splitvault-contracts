@@ -133,3 +133,79 @@ fn test_unauthorized_caller_rejected() {
     // because the test caller is not the authorized split contract.
     DashboardContractClient::new(&env, &dashboard_id).record_created(&creator, &100_i128);
 }
+
+// ---------------------------------------------------------------------------
+// #50 — Dashboard event emission tests
+// ---------------------------------------------------------------------------
+
+use soroban_sdk::testutils::Events as _;
+use soroban_sdk::{symbol_short, TryFromVal, Val};
+
+fn find_dash_event(env: &Env, action: soroban_sdk::Symbol) -> bool {
+    let events = env.events().all();
+    for event in events.events().iter() {
+        let soroban_sdk::xdr::ContractEventBody::V0(body) = &event.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        let topics_ref: &[soroban_sdk::xdr::ScVal] = body.topics.as_ref();
+        for v in topics_ref.iter() {
+            if let Ok(val) = <Val as TryFromVal<Env, soroban_sdk::xdr::ScVal>>::try_from_val(env, v) {
+                topics.push_back(val);
+            }
+        }
+        if topics.len() >= 2 {
+            let t0 = <soroban_sdk::Symbol as TryFromVal<Env, Val>>::try_from_val(env, &topics.get_unchecked(0));
+            let t1 = <soroban_sdk::Symbol as TryFromVal<Env, Val>>::try_from_val(env, &topics.get_unchecked(1));
+            if let (Ok(topic0), Ok(topic1)) = (t0, t1) {
+                if topic0 == symbol_short!("dash") && topic1 == action {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `record_created` must emit `(dash, created, creator)` (#50).
+#[test]
+fn test_record_created_emits_event() {
+    let (env, _split_id, dashboard_id) = setup();
+    let client = DashboardContractClient::new(&env, &dashboard_id);
+    let creator = Address::generate(&env);
+
+    client.record_created(&creator, &500_i128);
+
+    assert!(
+        find_dash_event(&env, symbol_short!("created")),
+        "record_created did not emit (dash, created) event",
+    );
+}
+
+/// `record_released` must emit `(dash, released, creator)` (#50).
+#[test]
+fn test_record_released_emits_event() {
+    let (env, _split_id, dashboard_id) = setup();
+    let client = DashboardContractClient::new(&env, &dashboard_id);
+    let creator = Address::generate(&env);
+
+    client.record_released(&creator, &300_i128);
+
+    assert!(
+        find_dash_event(&env, symbol_short!("released")),
+        "record_released did not emit (dash, released) event",
+    );
+}
+
+/// `record_refunded` must emit `(dash, refunded, creator)` (#50).
+#[test]
+fn test_record_refunded_emits_event() {
+    let (env, _split_id, dashboard_id) = setup();
+    let client = DashboardContractClient::new(&env, &dashboard_id);
+    let creator = Address::generate(&env);
+
+    client.record_refunded(&creator);
+
+    assert!(
+        find_dash_event(&env, symbol_short!("refunded")),
+        "record_refunded did not emit (dash, refunded) event",
+    );
+}
