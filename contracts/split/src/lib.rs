@@ -791,6 +791,13 @@ fn cert_key(invoice_id: u64) -> (Symbol, u64) {
     (symbol_short!("cert"), invoice_id)
 }
 
+/// Issue #114: amount a beneficiary has been credited with via `delegate_pay`
+/// on a given invoice — persistent storage. Attribution only; refunds always
+/// go to the funding delegate recorded as `Payment::payer`.
+fn delegate_credit_key(invoice_id: u64, beneficiary: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("del_cred"), invoice_id, beneficiary.clone())
+}
+
 const PAYMENT_WINDOW_CAP: u32 = 100;
 
 /// NFT gate contract address key (issue #192).
@@ -872,6 +879,9 @@ fn min_recipients_key() -> Symbol {
 fn payer_history_key(payer: &Address) -> (Symbol, Address) {
     (symbol_short!("pay_hist"), payer.clone())
 }
+
+/// Issue #125: minimum delay between `propose_upgrade` and `execute_upgrade`.
+const UPGRADE_TIMELOCK_SECS: u64 = 48 * 60 * 60;
 
 /// Issue #310: pending upgrade proposal — instance storage.
 fn upgrade_proposal_key() -> Symbol {
@@ -14021,7 +14031,10 @@ impl SplitContract {
     }
 
     /// Pay toward an invoice using an authorised delegate.
-    /// The invoice records the beneficiary as the payer.
+    ///
+    /// The delegate supplies the funds, so the payment is recorded with the
+    /// delegate as `payer` (refunds return to the delegate). The beneficiary
+    /// is credited separately for attribution via `get_delegate_credit`.
     pub fn delegate_pay(
         env: Env,
         delegate: Address,
@@ -14060,15 +14073,16 @@ impl SplitContract {
         let token_client = token::Client::new(&env, &funding_token_for(&invoice));
         token_client.transfer(&delegate, &env.current_contract_address(), &amount);
 
-        // Write payment to sharded storage (issue #177).
-        let shard_id = compute_shard_id(&env, &beneficiary);
+        // Write payment to sharded storage (issue #177). Issue #114: the
+        // funding delegate is the payer so refunds return to the actual source.
+        let shard_id = compute_shard_id(&env, &delegate);
         let mut shard_payments: Vec<Payment> = env
             .storage()
             .persistent()
             .get::<(Symbol, u64, u64), Vec<Payment>>(&pay_shard_key(invoice_id, shard_id))
             .unwrap_or_else(|| Vec::new(&env));
         shard_payments.push_back(Payment {
-            payer: beneficiary.clone(),
+            payer: delegate.clone(),
             amount,
             tip: 0,
             attestation_hash: None,
@@ -14079,6 +14093,12 @@ impl SplitContract {
         env.storage()
             .persistent()
             .set(&pay_shard_key(invoice_id, shard_id), &shard_payments);
+
+        let credit_key = delegate_credit_key(invoice_id, &beneficiary);
+        let credited: i128 = env.storage().persistent().get(&credit_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&credit_key, &(credited + amount));
 
         invoice.funded += amount;
         let cumulative_key = cumulative_contributed_key(invoice_id);
@@ -14117,6 +14137,15 @@ impl SplitContract {
         } else {
             save_invoice(&env, invoice_id, &invoice);
         }
+    }
+
+    /// Issue #114: total amount credited to `beneficiary` on `invoice_id`
+    /// through `delegate_pay`.
+    pub fn get_delegate_credit(env: Env, invoice_id: u64, beneficiary: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&delegate_credit_key(invoice_id, &beneficiary))
+            .unwrap_or(0)
     }
 
     fn enforce_payment_limits(
@@ -14285,14 +14314,20 @@ impl SplitContract {
             .release_timestamp
             .unwrap_or_else(|| env.ledger().timestamp());
 
-        // Deterministic preimage: invoice_id || total || release_timestamp
-        let mut preimage = [0u8; 32];
-        preimage[..8].copy_from_slice(&invoice_id.to_be_bytes());
-        preimage[8..24].copy_from_slice(&total.to_be_bytes());
-        preimage[24..32].copy_from_slice(&release_timestamp.to_be_bytes());
-
-        let bytes = Bytes::from_array(&env, &preimage);
-        let cert_hash: BytesN<32> = env.crypto().sha256(&bytes).into();
+        // Issue #120: commit to the full settlement context so a certificate
+        // cannot be replayed across contract instances or invoices that share
+        // an id/total but paid different recipients or tokens.
+        let preimage = (
+            env.current_contract_address(),
+            invoice_id,
+            total,
+            release_timestamp,
+            funding_token_for(&invoice),
+            invoice.tokens.clone(),
+            invoice.recipients.clone(),
+            invoice.amounts.clone(),
+        );
+        let cert_hash: BytesN<32> = env.crypto().sha256(&preimage.to_xdr(&env)).into();
 
         let cert = PaymentCertificate {
             invoice_id,
@@ -14320,8 +14355,13 @@ impl SplitContract {
 
     /// Estimate the compute cost of releasing a given invoice without executing it.
     /// Returns { estimated_instructions, estimated_fee_stroops, would_succeed }.
+    ///
+    /// Issue #121: fails with the matching `ContractError` when the invoice is
+    /// not currently releasable (wrong status, frozen, disputed, underfunded or
+    /// prerequisite unmet), mirroring the guards in `release`.
     pub fn simulate_release(env: Env, invoice_id: u64) -> SimulateReleaseResult {
         let invoice = load_invoice(&env, invoice_id);
+        Self::assert_releasable(&env, invoice_id, &invoice);
         let recipient_count = invoice.recipients.len() as u64;
         let shard_count = SHARD_COUNT;
 
@@ -14338,6 +14378,56 @@ impl SplitContract {
             estimated_instructions,
             estimated_fee_stroops,
             would_succeed,
+        }
+    }
+
+    /// Issue #121: release pre-conditions shared with `simulate_release`.
+    fn assert_releasable(env: &Env, invoice_id: u64, invoice: &Invoice) {
+        if invoice.status != InvoiceStatus::Pending
+            && invoice.status != InvoiceStatus::PartiallyReleased
+        {
+            panic_with_error!(env, ContractError::InvalidStatus);
+        }
+        if invoice.frozen || invoice.admin_frozen {
+            panic_with_error!(env, ContractError::InvoiceFrozen);
+        }
+        if invoice.disputed {
+            let resolved = env
+                .storage()
+                .persistent()
+                .get::<(Symbol, u64), DisputeRecord>(&dispute_record_key(invoice_id))
+                .map(|record| record.status != DisputeStatus::Active)
+                .unwrap_or(false);
+            if !resolved {
+                panic_with_error!(env, ContractError::InvoiceDisputed);
+            }
+        }
+        if let Some(prereq_id) = invoice.prerequisite_id {
+            if load_invoice(env, prereq_id).status != InvoiceStatus::Released {
+                panic_with_error!(env, ContractError::PrerequisiteNotMet);
+            }
+        }
+
+        let total: i128 = invoice.amounts.iter().sum();
+        let min_required = if invoice.min_funding_bps > 0 {
+            (total as u128 * invoice.min_funding_bps as u128 / 10_000u128) as i128
+        } else {
+            total
+        };
+        let paid_set: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&paid_recipients_key(invoice_id))
+            .unwrap_or_else(|| Vec::new(env));
+        let mut already_paid: i128 = 0;
+        for i in 0..invoice.recipients.len() {
+            let r = invoice.recipients.get(i).unwrap();
+            if paid_set.iter().any(|p| p == r) {
+                already_paid += invoice.amounts.get(i).unwrap();
+            }
+        }
+        if invoice.funded < min_required.saturating_sub(already_paid) {
+            panic_with_error!(env, ContractError::FundingInsufficient);
         }
     }
 
@@ -14636,16 +14726,19 @@ impl SplitContract {
     // Issue #310: Two-step upgrade with 48-hour timelock
     // -----------------------------------------------------------------------
 
-    /// Propose a contract upgrade. Only the admin may call this.
+    /// Propose a contract upgrade. Requires the `SuperAdmin` role.
     ///
     /// Stores a pending proposal with an eligible_at = now + 48 h.
-    /// Overwrites any existing proposal (only one active at a time).
+    /// Issue #125: an active proposal cannot be overwritten; it must be
+    /// removed with `cancel_upgrade` first so the timelock always restarts.
     pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
-        require_admin(&env);
-        let _ = admin;
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        assert!(
+            !env.storage().instance().has(&upgrade_proposal_key()),
+            "upgrade proposal already pending"
+        );
 
-        const FORTY_EIGHT_HOURS: u64 = 48 * 60 * 60;
-        let eligible_at = env.ledger().timestamp().saturating_add(FORTY_EIGHT_HOURS);
+        let eligible_at = env.ledger().timestamp().saturating_add(UPGRADE_TIMELOCK_SECS);
 
         let proposal = UpgradeProposal {
             new_wasm_hash: new_wasm_hash.clone(),
@@ -14679,10 +14772,10 @@ impl SplitContract {
             .update_current_contract_wasm(proposal.new_wasm_hash);
     }
 
-    /// Cancel a pending upgrade proposal. Only the admin may call this.
+    /// Cancel a pending upgrade proposal. Requires the `SuperAdmin` role.
     pub fn cancel_upgrade(env: Env, admin: Address) {
-        let admin_addr = require_admin(&env);
-        let _ = admin;
+        require_admin_role(&env, &admin, AdminRole::SuperAdmin);
+        let admin_addr = admin;
 
         assert!(
             env.storage().instance().has(&upgrade_proposal_key()),

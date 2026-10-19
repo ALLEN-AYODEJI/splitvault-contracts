@@ -4013,7 +4013,7 @@ impl MockNotification {
 }
 
 #[test]
-fn test_authorise_delegate_and_delegate_pay_records_beneficiary_as_payer() {
+fn test_authorise_delegate_and_delegate_pay_records_delegate_as_payer() {
     let (env, contract_id, token_id) = setup_initialized();
     let c = client(&env, &contract_id);
     let tk = token_client(&env, &token_id);
@@ -4032,9 +4032,39 @@ fn test_authorise_delegate_and_delegate_pay_records_beneficiary_as_payer() {
 
     let invoice = c.get_invoice(&id);
     assert_eq!(invoice.funded, 100);
-    assert_eq!(invoice.payments.get(0).unwrap().payer, beneficiary);
+    assert_eq!(invoice.payments.get(0).unwrap().payer, delegate);
     assert_eq!(invoice.payments.get(0).unwrap().amount, 100);
+    assert_eq!(c.get_delegate_credit(&id, &beneficiary), 100);
     assert_eq!(tk.balance(&recipient), 100);
+}
+
+#[test]
+fn test_114_delegate_pay_refund_returns_to_delegate() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let tk = token_client(&env, &token_id);
+
+    let creator = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let delegate = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    StellarAssetClient::new(&env, &token_id).mint(&delegate, &200);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 2_000);
+    c.authorise_delegate(&beneficiary, &delegate);
+    c.delegate_pay(&delegate, &beneficiary, &id, &40_i128);
+    assert_eq!(tk.balance(&delegate), 160);
+
+    env.ledger().set_timestamp(2_001);
+
+    // Beneficiary supplied nothing, so it has nothing to reclaim.
+    c.claim_refund(&beneficiary, &id);
+    assert_eq!(tk.balance(&beneficiary), 0);
+
+    c.claim_refund(&delegate, &id);
+    assert_eq!(tk.balance(&delegate), 200);
 }
 
 #[test]
@@ -5618,6 +5648,73 @@ fn test_milestone_disabled_when_threshold_zero() {
 // Issue #298: simulate_release compute cost estimation
 // ---------------------------------------------------------------------------
 
+/// Mark an invoice as fully funded without triggering auto-release, so
+/// `simulate_release` sees a releasable invoice.
+fn force_fund(env: &Env, contract_id: &Address, id: u64) {
+    env.as_contract(contract_id, || {
+        let mut invoice = load_invoice(env, id);
+        invoice.funded = invoice.amounts.iter().sum();
+        save_invoice(env, id, &invoice);
+    });
+}
+
+#[test]
+fn test_121_simulate_release_rejects_unfunded_invoice() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    assert_eq!(
+        c.try_simulate_release(&id).unwrap_err(),
+        Ok(ContractError::FundingInsufficient.into())
+    );
+}
+
+#[test]
+fn test_121_simulate_release_rejects_released_invoice() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100);
+    assert_eq!(
+        c.try_simulate_release(&id).unwrap_err(),
+        Ok(ContractError::InvalidStatus.into())
+    );
+}
+
+#[test]
+fn test_121_simulate_release_rejects_disputed_invoice() {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    force_fund(&env, &contract_id, id);
+    env.as_contract(&contract_id, || {
+        let mut invoice = load_invoice(&env, id);
+        invoice.disputed = true;
+        save_invoice(&env, id, &invoice);
+    });
+    assert_eq!(
+        c.try_simulate_release(&id).unwrap_err(),
+        Ok(ContractError::InvoiceDisputed.into())
+    );
+}
+
 #[test]
 fn test_simulate_release_returns_result_for_small_invoice() {
     let (env, contract_id, token_id) = setup_initialized();
@@ -5628,6 +5725,7 @@ fn test_simulate_release_returns_result_for_small_invoice() {
     env.ledger().set_timestamp(1_000);
 
     let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
 
     // A single-recipient invoice should be well within budget.
@@ -5661,6 +5759,7 @@ fn test_simulate_release_at_limit_succeeds() {
         amounts.push_back(1_i128);
     }
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env));
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
     assert!(result.would_succeed, "invoice at limit should succeed");
 }
@@ -5685,6 +5784,7 @@ fn test_simulate_release_over_limit_fails() {
         amounts.push_back(1_i128);
     }
     let id = c.create_invoice(&creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env));
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
     assert!(!result.would_succeed, "invoice over limit should not succeed");
 }
@@ -6876,6 +6976,7 @@ fn test_simulate_release_single_recipient() {
 
     let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
 
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
     assert!(result.estimated_instructions > 0);
     assert!(result.would_succeed); // single recipient should fit in budget
@@ -6901,6 +7002,7 @@ fn test_simulate_release_multiple_recipients() {
         &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
     );
 
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
     assert!(result.estimated_instructions > 0);
     assert!(result.would_succeed);
@@ -6925,6 +7027,7 @@ fn test_simulate_release_instruction_budget_calculation() {
         &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
     );
 
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
 
     // Verify calculation: INSTRUCTIONS_BASE + 1 * INSTRUCTIONS_PER_RECIPIENT + SHARD_COUNT * INSTRUCTIONS_PER_SHARD
@@ -6949,6 +7052,7 @@ fn test_simulate_release_would_succeed_at_budget_limit() {
     let recipient = Address::generate(&env);
     let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
 
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
     assert!(result.would_succeed, "single recipient should fit in budget");
     assert!(result.estimated_instructions < 100_000_000); // INSTRUCTION_BUDGET_LIMIT
@@ -7746,6 +7850,7 @@ fn test_simulate_release_estimate_for_large_invoice() {
         &creator, &recipients, &amounts, &token_id, &9_999_u64, &default_options(&env),
     );
 
+    force_fund(&env, &contract_id, id);
     let result = c.simulate_release(&id);
     // With 50 recipients: BASE (1M) + 50*RECIPIENT (25M) + 8*SHARD (0.8M) = ~26.8M
     let expected = 1_000_000 + 50 * 500_000 + 8 * 100_000;
@@ -7898,15 +8003,23 @@ fn init_contract(env: &Env, contract_id: &Address, token_id: &Address) {
     c.initialize(&admin, &0_i128, &treasury, token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
 }
 
+fn init_with_admin(env: &Env, contract_id: &Address, token_id: &Address) -> Address {
+    let c = SplitContractClient::new(env, contract_id);
+    let admin = Address::generate(env);
+    let treasury = Address::generate(env);
+    c.initialize(&admin, &0_i128, &treasury, token_id, &0_u32, &None, &0_u32, &0_u32, &0_u64);
+    admin
+}
+
 #[test]
 fn test_310_propose_and_get_upgrade() {
     let (env, contract_id, token_id) = setup();
-    init_contract(&env, &contract_id, &token_id);
+    let admin = init_with_admin(&env, &contract_id, &token_id);
     let c = client(&env, &contract_id);
 
     env.ledger().set_timestamp(1_000);
     let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
-    c.propose_upgrade(&Address::generate(&env), &wasm_hash);
+    c.propose_upgrade(&admin, &wasm_hash);
 
     let proposal = c.get_upgrade_proposal();
     assert!(proposal.is_some());
@@ -7919,12 +8032,12 @@ fn test_310_propose_and_get_upgrade() {
 #[should_panic(expected = "upgrade timelock still active")]
 fn test_310_execute_upgrade_before_timelock_panics() {
     let (env, contract_id, token_id) = setup();
-    init_contract(&env, &contract_id, &token_id);
+    let admin = init_with_admin(&env, &contract_id, &token_id);
     let c = client(&env, &contract_id);
 
     env.ledger().set_timestamp(1_000);
     let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[2u8; 32]);
-    c.propose_upgrade(&Address::generate(&env), &wasm_hash);
+    c.propose_upgrade(&admin, &wasm_hash);
 
     // Try to execute immediately — should panic
     c.execute_upgrade();
@@ -7933,15 +8046,15 @@ fn test_310_execute_upgrade_before_timelock_panics() {
 #[test]
 fn test_310_cancel_upgrade() {
     let (env, contract_id, token_id) = setup();
-    init_contract(&env, &contract_id, &token_id);
+    let admin = init_with_admin(&env, &contract_id, &token_id);
     let c = client(&env, &contract_id);
 
     env.ledger().set_timestamp(1_000);
     let wasm_hash: BytesN<32> = BytesN::from_array(&env, &[3u8; 32]);
-    c.propose_upgrade(&Address::generate(&env), &wasm_hash);
+    c.propose_upgrade(&admin, &wasm_hash);
     assert!(c.get_upgrade_proposal().is_some());
 
-    c.cancel_upgrade(&Address::generate(&env));
+    c.cancel_upgrade(&admin);
     assert!(c.get_upgrade_proposal().is_none());
 }
 
@@ -7949,24 +8062,65 @@ fn test_310_cancel_upgrade() {
 #[should_panic(expected = "no upgrade proposal")]
 fn test_310_cancel_without_proposal_panics() {
     let (env, contract_id, token_id) = setup();
-    init_contract(&env, &contract_id, &token_id);
+    let admin = init_with_admin(&env, &contract_id, &token_id);
     let c = client(&env, &contract_id);
 
-    c.cancel_upgrade(&Address::generate(&env));
+    c.cancel_upgrade(&admin);
 }
 
 #[test]
-fn test_310_propose_overwrites_existing() {
+#[should_panic(expected = "upgrade proposal already pending")]
+fn test_125_propose_cannot_overwrite_pending() {
     let (env, contract_id, token_id) = setup();
-    init_contract(&env, &contract_id, &token_id);
+    let admin = init_with_admin(&env, &contract_id, &token_id);
     let c = client(&env, &contract_id);
 
     env.ledger().set_timestamp(1_000);
     let hash1: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
     let hash2: BytesN<32> = BytesN::from_array(&env, &[2u8; 32]);
-    c.propose_upgrade(&Address::generate(&env), &hash1);
-    // Second proposal overwrites the first — no panic.
-    c.propose_upgrade(&Address::generate(&env), &hash2);
+    c.propose_upgrade(&admin, &hash1);
+    c.propose_upgrade(&admin, &hash2);
+}
+
+#[test]
+fn test_125_propose_after_cancel_restarts_timelock() {
+    let (env, contract_id, token_id) = setup();
+    let admin = init_with_admin(&env, &contract_id, &token_id);
+    let c = client(&env, &contract_id);
+
+    env.ledger().set_timestamp(1_000);
+    let hash1: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+    let hash2: BytesN<32> = BytesN::from_array(&env, &[2u8; 32]);
+    c.propose_upgrade(&admin, &hash1);
+    env.ledger().set_timestamp(5_000);
+    c.cancel_upgrade(&admin);
+    c.propose_upgrade(&admin, &hash2);
+
+    let p = c.get_upgrade_proposal().unwrap();
+    assert_eq!(p.new_wasm_hash, hash2);
+    assert_eq!(p.eligible_at, 5_000 + 48 * 3600);
+}
+
+#[test]
+#[should_panic(expected = "requires SuperAdmin role")]
+fn test_125_operator_cannot_propose_upgrade() {
+    let (env, contract_id, token_id) = setup();
+    let admin = init_with_admin(&env, &contract_id, &token_id);
+    let c = client(&env, &contract_id);
+
+    let operator = Address::generate(&env);
+    c.add_admin(&admin, &operator, &AdminRole::Operator);
+    c.propose_upgrade(&operator, &BytesN::from_array(&env, &[1u8; 32]));
+}
+
+#[test]
+#[should_panic(expected = "caller is not an admin")]
+fn test_125_non_admin_cannot_propose_upgrade() {
+    let (env, contract_id, token_id) = setup();
+    init_with_admin(&env, &contract_id, &token_id);
+    let c = client(&env, &contract_id);
+
+    c.propose_upgrade(&Address::generate(&env), &BytesN::from_array(&env, &[1u8; 32]));
 }
 
 // ---------------------------------------------------------------------------
@@ -8971,4 +9125,33 @@ fn test_withdraw_contribution_no_double_refund() {
         balance_after_refund, 1_000,
         "double-refund detected: payer received tokens twice"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #120: certificate hash commits to recipients, tokens and contract
+// ---------------------------------------------------------------------------
+
+fn issue_cert_hash_for_fresh_invoice() -> (u64, [u8; 32]) {
+    let (env, contract_id, token_id) = setup_initialized();
+    let c = client(&env, &contract_id);
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let payer = Address::generate(&env);
+    StellarAssetClient::new(&env, &token_id).mint(&payer, &100);
+    env.ledger().set_timestamp(1_000);
+
+    let id = make_invoice(&env, &c, &creator, &recipient, 100, &token_id, 9_999);
+    c.pay(&payer, &id, &100);
+    let cert = c.issue_certificate(&id);
+    (id, cert.cert_hash.to_array())
+}
+
+#[test]
+fn test_120_certificate_hash_differs_by_recipient() {
+    // Identical invoice id, total and release timestamp; different
+    // recipients, tokens and contract instance.
+    let (id_a, hash_a) = issue_cert_hash_for_fresh_invoice();
+    let (id_b, hash_b) = issue_cert_hash_for_fresh_invoice();
+    assert_eq!(id_a, id_b);
+    assert_ne!(hash_a, hash_b);
 }
